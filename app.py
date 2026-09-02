@@ -2330,12 +2330,74 @@ CUSTOM_CSS = f"""
         color: #182230 !important;
         color-scheme: light !important;
     }}
-    #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"],
+    #MainMenu, footer, [data-testid="stDecoration"],
     [data-testid="stStatusWidget"], [data-testid="stAppDeployButton"] {{
         display:none !important;
         visibility:hidden !important;
     }}
-    header[data-testid="stHeader"] {{ background:transparent !important; box-shadow:none !important; }}
+
+    /* -------------------------------------------------------------
+       SIDEBAR TOGGLE - toujours accessible
+       Ne jamais masquer stToolbar : suivant la version de Streamlit,
+       le bouton de reouverture de la sidebar peut y etre rattache.
+       ------------------------------------------------------------- */
+    [data-testid="stToolbar"] {{
+        display:flex !important;
+        visibility:visible !important;
+        background:transparent !important;
+    }}
+    header[data-testid="stHeader"] {{
+        background:transparent !important;
+        box-shadow:none !important;
+        visibility:visible !important;
+        pointer-events:auto !important;
+        z-index:999990 !important;
+    }}
+
+    /* Streamlit recent */
+    [data-testid="stSidebarCollapsedControl"],
+    /* Compatibilite anciennes versions */
+    [data-testid="collapsedControl"] {{
+        display:flex !important;
+        visibility:visible !important;
+        opacity:1 !important;
+        position:fixed !important;
+        top:.65rem !important;
+        left:.70rem !important;
+        z-index:1000000 !important;
+    }}
+    [data-testid="stSidebarCollapsedControl"] button,
+    [data-testid="collapsedControl"] button {{
+        display:flex !important;
+        visibility:visible !important;
+        align-items:center !important;
+        justify-content:center !important;
+        width:2.55rem !important;
+        height:2.55rem !important;
+        background:#FFFFFF !important;
+        border:1px solid #D9E0EA !important;
+        border-radius:10px !important;
+        box-shadow:0 2px 8px rgba(15,23,42,.10) !important;
+        color:#155EEF !important;
+    }}
+    [data-testid="stSidebarCollapsedControl"] button:hover,
+    [data-testid="collapsedControl"] button:hover {{
+        background:#F0F5FF !important;
+        border-color:#AFC6FF !important;
+    }}
+
+    /* Bouton de fermeture quand la sidebar est ouverte */
+    [data-testid="stSidebarCollapseButton"] {{
+        display:inline-flex !important;
+        visibility:visible !important;
+        opacity:1 !important;
+        z-index:1000000 !important;
+    }}
+    [data-testid="stSidebarCollapseButton"] button {{
+        background:#F8FAFC !important;
+        border:1px solid #E2E8F0 !important;
+        border-radius:9px !important;
+    }}
     .block-container {{ max-width:1480px; padding-top:1.1rem; padding-bottom:2.5rem; }}
     section[data-testid="stSidebar"], section[data-testid="stSidebar"] > div {{
         background:#FFFFFF !important;
