@@ -1,30 +1,40 @@
 # -*- coding: utf-8 -*-
 """
-ALLUCO — Planning IA Agentique v3
-================================
-Un seul fichier Python, conçu pour :
-- lire directement "Base Commandes Client encours confirmées par mois.xlsx" ;
-- apprendre les paramètres techniques depuis un ancien planning (optionnel) ;
-- générer automatiquement un planning Lundi -> Samedi ;
-- respecter 15 h/jour, les délais, la disponibilité matière, les couleurs et les lots client ;
-- optimiser avec OR-Tools CP-SAT si disponible, sinon utiliser un moteur heuristique robuste ;
-- produire un Excel au format métier ALLUCO (28 colonnes) identique au planning fourni.
+ALLUCO — Planning Laquage Agentic IA V5
+=======================================
+Un seul fichier Python, prêt pour GitHub / Streamlit Cloud.
 
-Le moteur est "agentique" au sens orchestration de plusieurs agents spécialisés :
-Données -> Référentiel -> Quantités -> Priorités -> Affectation -> Séquençage -> Critique -> Réparation -> Export.
-La décision de planification reste déterministe, explicable et auditable ; un LLM n'est pas nécessaire
-pour le cœur industriel.
+Entrée:
+    Bd-Client-S36.xlsx (versionné avec le dépôt, aucun upload utilisateur)
+
+Sortie:
+    Planning automatique Lundi -> Samedi, affiché dans Streamlit et exportable Excel.
+
+Politique couleur:
+    - 1 couleur/jour est fortement privilégiée;
+    - 2 couleurs/jour maximum (contrainte dure).
+
+Architecture agentique déterministe:
+    Données -> Référentiel source -> Quantités -> Priorités -> Scénarios ->
+    OR-Tools / fallback -> Couleurs -> Réparation -> Critique -> Validation -> Export.
+
+La valeur "Confiance règles = 100%" signifie que toutes les règles du moteur ont été
+validées (capacité, <=2 couleurs/jour, pas de doublon, jours actifs, etc.). Elle ne
+constitue pas une garantie de réalité terrain si les données sources sont incorrectes.
 """
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import math
 import os
 import re
 import sys
+import time
 import unicodedata
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -34,6 +44,11 @@ import pandas as pd
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+try:
+    import tomllib  # Python 3.11+
+except Exception:  # pragma: no cover
+    tomllib = None
 
 try:
     import streamlit as st
@@ -47,7 +62,16 @@ except Exception:
     cp_model = None
     ORTOOLS_AVAILABLE = False
 
-APP_NAME = "ALLUCO — Planning IA Agentique"
+
+# =============================================================================
+# 1) CONFIGURATION
+# =============================================================================
+VERSION = "5.0.0"
+APP_NAME = "ALLUCO — Planning Laquage IA"
+APP_SUBTITLE = "Agentic AI · Planification automatique"
+ROOT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = ROOT_DIR / "config.toml"
+
 DAYS = ["LUNDI", "MARDI", "MERCREDI", "JEUDI", "VENDREDI", "SAMEDI"]
 SHEET_NAMES = [f"Planning {d.capitalize()}" for d in DAYS[:-1]] + ["Planning SAMEDI"]
 
@@ -59,24 +83,64 @@ OUTPUT_COLUMNS = [
 ]
 
 DEFAULT_NUANCE = {
-    "BLC": 1.0,
-    "R9016": 3.0,
-    "ACAJOU": 15.1,
-    "GRIS": 22.0,
-    "GREY": 24.0,
-    "GRISG": 25.0,
-    "NOIR": 37.0,
-    "DARK": 38.0,
+    "BLC": 1.0, "R9016": 2.0, "R1013": 5.0, "R1019": 7.0,
+    "SAND": 9.0, "FRENE": 11.0, "TECK": 13.0, "ACAJOU": 15.0,
+    "NOYER": 16.0, "NOCE": 17.0, "R8019": 19.0, "TRESOR": 20.0,
+    "GRIS": 22.0, "GREY": 23.0, "GRISG": 24.0, "R7016": 27.0,
+    "CHPG": 29.0, "COOL": 31.0, "N02": 33.0, "N07": 34.0,
+    "N22": 35.0, "NOIR": 37.0, "DARK": 38.0,
+    "ANOD": 40.0, "ANODN": 41.0, "ABRONZE": 42.0,
 }
 
-DEFAULT_POWDER_COEFF = 0.052
-DEFAULT_MIN_PER_BAL = 4.0  # confirmé par le Planning S36 : tps = Nbre Bal * 4 min
-DEFAULT_CAPACITY_H = 15.0
+# Référentiel atelier embarqué, utilisé uniquement quand Barre/bal n'est pas disponible
+# dans le fichier commandes. Il évite de dépendre d'un ancien Planning S36 dans GitHub.
+FAMILY_BARS_PER_BAL = {
+    "EC": 13, "FR": 13, "CSQ": 13, "FSQ": 13, "CO": 13,
+    "LM": 17, "GL": 20, "P": 14, "PL": 20, "C": 10,
+    "LMDP": 14, "LMDPF": 20, "AL": 10, "LMMO": 19,
+    "MR": 9, "PR": 6, "PCN": 800, "T": 800,
+}
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
 
+def _load_toml() -> Dict[str, Any]:
+    if tomllib is None or not CONFIG_PATH.exists():
+        return {}
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return {}
+
+
+APP_CONFIG = _load_toml()
+DATA_CFG = APP_CONFIG.get("data", {})
+PLAN_CFG = APP_CONFIG.get("planning", {})
+UI_CFG = APP_CONFIG.get("ui", {})
+
+SOURCE_FILENAME = str(DATA_CFG.get("source_file", "Bd-Client-S36.xlsx"))
+SOURCE_PATH = ROOT_DIR / SOURCE_FILENAME
+
+DEFAULT_YEAR = int(PLAN_CFG.get("year", 2026))
+DEFAULT_WEEK = int(PLAN_CFG.get("week", 36))
+DEFAULT_CAPACITY_H = float(PLAN_CFG.get("capacity_weekday_h", 15.0))
+DEFAULT_SATURDAY_ENABLED = bool(PLAN_CFG.get("saturday_enabled", True))
+DEFAULT_SATURDAY_CAPACITY_H = float(PLAN_CFG.get("saturday_capacity_h", 15.0))
+DEFAULT_MIN_PER_BAL = float(PLAN_CFG.get("minutes_per_bal", 4.0))
+DEFAULT_POWDER_COEFF = float(PLAN_CFG.get("powder_coeff", 0.052))
+DEFAULT_CLEANING_MIN = int(PLAN_CFG.get("cleaning_min", 15))
+DEFAULT_TARGET_UTIL = float(PLAN_CFG.get("target_utilization", 0.94))
+DEFAULT_SOLVER_SECONDS = float(PLAN_CFG.get("solver_seconds", 18.0))
+DEFAULT_AUTO_GENERATE = bool(PLAN_CFG.get("auto_generate", True))
+DEFAULT_ALLOW_RELAQUAGE = bool(PLAN_CFG.get("allow_relaquage", False))
+DEFAULT_MAX_JOBS = int(PLAN_CFG.get("max_jobs", 1600))
+DEFAULT_POOL_FACTOR = float(PLAN_CFG.get("pool_factor", 2.7))
+PREFERRED_COLORS_PER_DAY = 1
+HARD_MAX_COLORS_PER_DAY = 2
+
+
+# =============================================================================
+# 2) HELPERS
+# =============================================================================
 def norm_text(v: Any) -> str:
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return ""
@@ -108,7 +172,6 @@ def to_int(v: Any, default: int = 0) -> int:
 
 
 def parse_date(v: Any) -> Optional[pd.Timestamp]:
-    """Accepte datetime, texte et numéro de série Excel."""
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return None
     try:
@@ -132,49 +195,64 @@ def iso_week_dates(year: int, week: int) -> Dict[int, date]:
     return {i: monday + timedelta(days=i) for i in range(6)}
 
 
+def _looks_like_color_token(token: str) -> bool:
+    t = norm_text(token).upper()
+    if not t or t == "BRUT":
+        return False
+    # Écarter les suffixes qui ressemblent clairement à des dimensions/références produit.
+    if re.search(r"\d+(?:[.,]\d+)?X\d+", t) or "/" in t or "." in t:
+        return False
+    if t in DEFAULT_NUANCE:
+        return True
+    if re.fullmatch(r"R\d{4}", t) or re.fullmatch(r"N\d{2}", t):
+        return True
+    # Noms de teintes libres (OTARIE, SWEET, GALET, WENGE, etc.).
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9]{1,14}", t))
+
+
 def split_article(article: Any) -> Tuple[str, str]:
     s = norm_text(article)
     if "-" not in s:
         return s, ""
     left, right = s.rsplit("-", 1)
-    return left.strip(), right.strip().upper()
+    color = right.strip().upper()
+    if not _looks_like_color_token(color):
+        return s, ""
+    return left.strip(), color
 
 
-def mode_numeric(values: Iterable[Any], default: float = 0.0) -> float:
-    vals = [round(to_float(v), 6) for v in values if to_float(v) > 0]
-    if not vals:
-        return default
-    c = Counter(vals)
-    return float(c.most_common(1)[0][0])
+def article_family(article_internal: str) -> str:
+    s = norm_text(article_internal).upper()
+    m = re.match(r"([A-Z]+)", s)
+    return m.group(1) if m else ""
 
 
-def bytes_from_file(obj: Any) -> bytes:
-    if isinstance(obj, bytes):
-        return obj
-    if isinstance(obj, (str, Path)):
-        return Path(obj).read_bytes()
-    if hasattr(obj, "getvalue"):
-        return obj.getvalue()
-    if hasattr(obj, "read"):
-        pos = obj.tell() if hasattr(obj, "tell") else None
-        data = obj.read()
-        if pos is not None and hasattr(obj, "seek"):
-            obj.seek(pos)
-        return data
-    raise TypeError("Type de fichier non supporté")
+def stable_unknown_nuance(color: str) -> float:
+    # déterministe pour que deux exécutions donnent le même ordre.
+    h = hashlib.sha256(norm_text(color).upper().encode("utf-8")).hexdigest()
+    return 50.0 + (int(h[:6], 16) % 4000) / 100.0
 
 
-# -----------------------------------------------------------------------------
-# Agent 1 — Lecture / normalisation du classeur source
-# -----------------------------------------------------------------------------
+def bytes_from_path(path: Path) -> bytes:
+    return path.read_bytes()
 
-def _compact_sheet_rows(ws, header_row: int = 1, key_col: int = 1, blank_stop: int = 150) -> pd.DataFrame:
-    """Lecture compacte : évite les centaines de milliers de lignes formatées mais vides."""
+
+def format_num(v: float, digits: int = 0) -> str:
+    if digits == 0:
+        return f"{v:,.0f}".replace(",", " ")
+    return f"{v:,.{digits}f}".replace(",", " ")
+
+
+# =============================================================================
+# 3) AGENT DONNÉES — lecture du fichier GitHub
+# =============================================================================
+def _compact_sheet_rows(ws, header_row: int = 1, key_col: int = 2, blank_stop: int = 180) -> pd.DataFrame:
     header = [c.value for c in next(ws.iter_rows(min_row=header_row, max_row=header_row))]
     while header and header[-1] is None:
         header.pop()
     if not header:
         return pd.DataFrame()
+
     rows: List[Tuple[Any, ...]] = []
     blanks = 0
     seen = False
@@ -204,181 +282,118 @@ def load_source_workbook(data: bytes) -> pd.DataFrame:
                 candidate = ws
                 break
     if candidate is None:
-        raise ValueError("Impossible de trouver la feuille commandes (NumCommande / Article).")
-    df = _compact_sheet_rows(candidate, header_row=1, key_col=2, blank_stop=200)
+        raise ValueError("Feuille commandes introuvable (NumCommande / Article).")
+    df = _compact_sheet_rows(candidate)
     if df.empty:
-        raise ValueError("La feuille commandes est vide.")
+        raise ValueError("Le fichier commandes est vide.")
+    required = ["NumCommande", "DateCréation", "NomClient", "Article", "QteCommandé", "ResteALivrer"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError("Colonnes obligatoires manquantes: " + ", ".join(missing))
     return df
 
 
-# -----------------------------------------------------------------------------
-# Agent 2 — Apprentissage du référentiel à partir d'un planning historique
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 4) AGENT RÉFÉRENTIEL — apprentissage uniquement depuis l'input
+# =============================================================================
 @dataclass
-class LearnedMaster:
-    article: pd.DataFrame
-    color: pd.DataFrame
-    powder_coeff: float = DEFAULT_POWDER_COEFF
-    minutes_per_bal: float = DEFAULT_MIN_PER_BAL
-    history_rows: int = 0
+class TechnicalMaster:
+    weight_by_article: Dict[str, float]
+    weight_by_family: Dict[str, float]
+    powder_coeff: float
+    minutes_per_bal: float
+    source_weight_samples: int
 
 
-def load_historical_planning(data: bytes) -> pd.DataFrame:
-    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-    frames: List[pd.DataFrame] = []
-    for ws in wb.worksheets:
-        if not ws.title.lower().startswith("planning"):
-            continue
-        df = _compact_sheet_rows(ws, header_row=1, key_col=1, blank_stop=30)
-        if df.empty or "NumCommande" not in df.columns:
-            continue
-        # certaines feuilles historiques ont une colonne vide supplémentaire
-        df = df[[c for c in OUTPUT_COLUMNS if c in df.columns]].copy()
-        df["_sheet"] = ws.title
-        frames.append(df)
-    if not frames:
-        return pd.DataFrame(columns=OUTPUT_COLUMNS)
-    return pd.concat(frames, ignore_index=True)
+def learn_source_master(source: pd.DataFrame, powder_coeff: float, minutes_per_bal: float) -> TechnicalMaster:
+    rows = []
+    for _, r in source.iterrows():
+        article_internal, _ = split_article(r.get("Article"))
+        w = to_float(r.get("PoidArticle"), 0.0)
+        if article_internal and w > 0:
+            rows.append((article_internal.upper(), article_family(article_internal), w))
+    if not rows:
+        return TechnicalMaster({}, {}, powder_coeff, minutes_per_bal, 0)
+
+    d = pd.DataFrame(rows, columns=["article", "family", "weight"])
+    exact = d.groupby("article")["weight"].median().to_dict()
+    fam_stats = d[d["family"] != ""].groupby("family")["weight"].agg(["median", "count"])
+    fam = {k: float(v["median"]) for k, v in fam_stats.iterrows() if int(v["count"]) >= 3}
+    return TechnicalMaster(exact, fam, powder_coeff, minutes_per_bal, len(d))
 
 
-def learn_master(history: Optional[pd.DataFrame]) -> LearnedMaster:
-    if history is None or history.empty:
-        color_df = pd.DataFrame([{"Couleur": k, "Nuance": v} for k, v in DEFAULT_NUANCE.items()])
-        return LearnedMaster(pd.DataFrame(), color_df)
-
-    h = history.copy()
-    for c in ["Nuance", "PoidsUn", "PoidsT", "Poudre", "Barre/bal", "Nbre Bal", "tps", "Stock brut", "Lancement", "ResteALivrer", "Re-laquage"]:
-        if c in h.columns:
-            h[c] = pd.to_numeric(h[c], errors="coerce")
-
-    art_rows = []
-    if "Article/int" in h.columns:
-        for art, g in h.groupby("Article/int", dropna=True):
-            art = norm_text(art)
-            if not art:
-                continue
-            w = pd.to_numeric(g.get("PoidsUn"), errors="coerce") if "PoidsUn" in g else pd.Series(dtype=float)
-            b = pd.to_numeric(g.get("Barre/bal"), errors="coerce") if "Barre/bal" in g else pd.Series(dtype=float)
-            sb = pd.to_numeric(g.get("Stock brut"), errors="coerce") if "Stock brut" in g else pd.Series(dtype=float)
-            nonres = g[g.get("reservation brut", pd.Series(index=g.index, dtype=object)).astype(str).str.lower().eq("non")]
-            hist_launch = pd.to_numeric(nonres.get("Lancement"), errors="coerce") if not nonres.empty else pd.Series(dtype=float)
-            art_rows.append({
-                "Article/int": art,
-                "PoidsUn": float(w[w > 0].median()) if (w > 0).any() else 0.0,
-                "Barre/bal": mode_numeric(b, 0.0),
-                "Stock brut": float(sb[sb >= 0].median()) if sb.notna().any() else 0.0,
-                "Batch historique": float(hist_launch[hist_launch > 0].median()) if (hist_launch > 0).any() else 0.0,
-                "N historique": int(len(g)),
-            })
-    article_df = pd.DataFrame(art_rows)
-
-    color_rows = []
-    if "Couleur" in h.columns:
-        for color, g in h.groupby("Couleur", dropna=True):
-            name = norm_text(color).upper()
-            if not name:
-                continue
-            n = pd.to_numeric(g.get("Nuance"), errors="coerce") if "Nuance" in g else pd.Series(dtype=float)
-            val = float(n.dropna().median()) if n.notna().any() else DEFAULT_NUANCE.get(name, np.nan)
-            color_rows.append({"Couleur": name, "Nuance": val})
-    color_df = pd.DataFrame(color_rows)
-    known = set(color_df["Couleur"].tolist()) if not color_df.empty else set()
-    extra = [{"Couleur": k, "Nuance": v} for k, v in DEFAULT_NUANCE.items() if k not in known]
-    if extra:
-        color_df = pd.concat([color_df, pd.DataFrame(extra)], ignore_index=True)
-
-    powder_coeff = DEFAULT_POWDER_COEFF
-    if {"Poudre", "PoidsT"}.issubset(h.columns):
-        ratio = h.loc[h["PoidsT"] > 0, "Poudre"] / h.loc[h["PoidsT"] > 0, "PoidsT"]
-        ratio = ratio.replace([np.inf, -np.inf], np.nan).dropna()
-        if not ratio.empty:
-            powder_coeff = float(ratio.median())
-
-    minutes_per_bal = DEFAULT_MIN_PER_BAL
-    if {"tps", "Nbre Bal"}.issubset(h.columns):
-        ratio = h.loc[h["Nbre Bal"] > 0, "tps"] * 60.0 / h.loc[h["Nbre Bal"] > 0, "Nbre Bal"]
-        ratio = ratio.replace([np.inf, -np.inf], np.nan).dropna()
-        if not ratio.empty:
-            minutes_per_bal = float(ratio.median())
-
-    return LearnedMaster(article_df, color_df, powder_coeff, minutes_per_bal, len(h))
+def infer_unit_weight(article_internal: str, direct: float, master: TechnicalMaster) -> Tuple[float, str]:
+    if direct > 0:
+        return direct, "source"
+    art = norm_text(article_internal).upper()
+    if art in master.weight_by_article:
+        return float(master.weight_by_article[art]), "article_source"
+    fam = article_family(art)
+    if fam in master.weight_by_family:
+        return float(master.weight_by_family[fam]), "famille_source"
+    return 0.0, "inconnu"
 
 
-def infer_bars_per_bal(article_internal: str, unit_weight: float, master: LearnedMaster) -> int:
-    if not master.article.empty:
-        hit = master.article[master.article["Article/int"].astype(str).str.upper() == article_internal.upper()]
-        if not hit.empty and to_float(hit.iloc[0]["Barre/bal"]) > 0:
-            return max(1, int(round(to_float(hit.iloc[0]["Barre/bal"]))))
-
-        # estimation par poids sur les références voisines, en supprimant les cas très spéciaux > 100 barres/bal
-        m = master.article.copy()
-        m["PoidsUn"] = pd.to_numeric(m["PoidsUn"], errors="coerce")
-        m["Barre/bal"] = pd.to_numeric(m["Barre/bal"], errors="coerce")
-        m = m[(m["PoidsUn"] > 0) & (m["Barre/bal"] > 0) & (m["Barre/bal"] <= 100)]
-        if unit_weight > 0 and not m.empty:
-            # priorité aux familles d'articles similaires (préfixe avant chiffre / tiret)
-            prefix = re.match(r"[A-Za-z]+", article_internal or "")
-            prefix = prefix.group(0).upper() if prefix else ""
-            if prefix:
-                same = m[m["Article/int"].astype(str).str.upper().str.startswith(prefix)]
-                if len(same) >= 3:
-                    m = same
-            m = m.assign(_dist=(np.log(m["PoidsUn"] + 1e-6) - math.log(unit_weight + 1e-6)).abs())
-            near = m.nsmallest(min(12, len(m)), "_dist")
-            if not near.empty:
-                return max(1, int(round(float(near["Barre/bal"].median()))))
-
-    # fallback prudent, basé sur le poids unitaire ; modifiable dans l'UI
+def infer_bars_per_bal(article_internal: str, unit_weight: float) -> Tuple[int, str]:
+    fam = article_family(article_internal)
+    if fam in FAMILY_BARS_PER_BAL:
+        return int(FAMILY_BARS_PER_BAL[fam]), "référentiel"
     if unit_weight <= 0:
-        return 13
+        return 13, "fallback"
+    # fallback physique prudent, borné pour éviter des valeurs absurdes.
+    if unit_weight <= 0.08:
+        return 200, "poids"
+    if unit_weight < 1.2:
+        return 25, "poids"
     if unit_weight < 2.0:
-        return 20
+        return 20, "poids"
     if unit_weight < 3.2:
-        return 17
+        return 17, "poids"
     if unit_weight < 8.0:
-        return 13
+        return 13, "poids"
     if unit_weight < 10.0:
-        return 9
-    return 6
+        return 9, "poids"
+    return 6, "poids"
 
 
-def master_value(master: LearnedMaster, article_internal: str, column: str, default: float = 0.0) -> float:
-    if master.article.empty:
-        return default
-    h = master.article[master.article["Article/int"].astype(str).str.upper() == article_internal.upper()]
-    if h.empty:
-        return default
-    return to_float(h.iloc[0].get(column), default)
+def color_nuance(color: str) -> Tuple[float, bool]:
+    c = norm_text(color).upper()
+    if c in DEFAULT_NUANCE:
+        return DEFAULT_NUANCE[c], True
+    return stable_unknown_nuance(c), False
 
 
-def color_nuance(master: LearnedMaster, color: str) -> Optional[float]:
-    color = color.upper()
-    if not master.color.empty:
-        h = master.color[master.color["Couleur"].astype(str).str.upper() == color]
-        if not h.empty:
-            v = to_float(h.iloc[0].get("Nuance"), np.nan)
-            if not np.isnan(v):
-                return v
-    return DEFAULT_NUANCE.get(color)
-
-
-# -----------------------------------------------------------------------------
-# Agent 3 — Construction des lignes métier / quantités à lancer
-# -----------------------------------------------------------------------------
-@dataclass
+# =============================================================================
+# 5) AGENT QUANTITÉS + PRIORITÉS
+# =============================================================================
+@dataclass(frozen=True)
 class PlannerConfig:
     year: int
     week: int
     capacity_h: float = DEFAULT_CAPACITY_H
-    cleaning_min: int = 0
-    max_colors_per_day: int = 3
-    strategy: str = "Équilibre"
-    use_historical_batches: bool = False
-    max_overproduction_pct: float = 20.0
-    allow_relaquage: bool = False
-    pool_factor: float = 4.0
-    max_jobs: int = 2200
-    solver_seconds: float = 12.0
+    saturday_enabled: bool = DEFAULT_SATURDAY_ENABLED
+    saturday_capacity_h: float = DEFAULT_SATURDAY_CAPACITY_H
+    cleaning_min: int = DEFAULT_CLEANING_MIN
+    minutes_per_bal: float = DEFAULT_MIN_PER_BAL
+    powder_coeff: float = DEFAULT_POWDER_COEFF
+    target_utilization: float = DEFAULT_TARGET_UTIL
+    solver_seconds: float = DEFAULT_SOLVER_SECONDS
+    max_jobs: int = DEFAULT_MAX_JOBS
+    pool_factor: float = DEFAULT_POOL_FACTOR
+    allow_relaquage: bool = DEFAULT_ALLOW_RELAQUAGE
+    strategy: str = "Auto — meilleur compromis"
+    force_commands: Tuple[str, ...] = ()
+    exclude_commands: Tuple[str, ...] = ()
+
+
+def day_capacity_h(cfg: PlannerConfig, d: int) -> float:
+    if d == 5:
+        return cfg.saturday_capacity_h if cfg.saturday_enabled else 0.0
+    return cfg.capacity_h
+
+
+def day_capacity_min(cfg: PlannerConfig, d: int) -> int:
+    return max(0, int(round(day_capacity_h(cfg, d) * 60)))
 
 
 def due_date_from_row(row: pd.Series) -> Optional[pd.Timestamp]:
@@ -390,49 +405,90 @@ def due_date_from_row(row: pd.Series) -> Optional[pd.Timestamp]:
     return None
 
 
-def status_ready_score(prod_status: str, reservation_brut: str, reserver_br: float, stock: float, qte_recue: float) -> float:
+def _ready_score(prod_status: str, reservation_flag: str, reserver_br: float, stock: float, qte_recue: float, remaining: float) -> float:
     s = 0.0
-    ps = prod_status.strip().lower()
-    if ps == "créé" or ps == "cree":
+    ps = norm_key(prod_status)
+    if "commenc" in ps:
+        s += 280
+    elif "cree" in ps:
+        s += 220
+    elif ps in {"", "_", "-"}:
         s += 80
-    elif "commenc" in ps:
-        s += 45
-    elif ps in {"-", ""}:
-        s += 20
-    if reservation_brut.lower() == "oui":
-        s += 55
-    if reserver_br > 0:
-        s += 25
-    if stock > 0:
-        s += 12
-    if qte_recue > 0:
-        s += 20
+    if norm_key(reservation_flag) in {"oui", "yes", "1", "true"}:
+        s += 260
+    if remaining > 0:
+        s += min(260, (reserver_br / remaining) * 260) if reserver_br > 0 else 0
+        s += min(100, (stock / remaining) * 100) if stock > 0 else 0
+        s += min(120, (qte_recue / remaining) * 120) if qte_recue > 0 else 0
     return s
 
 
-def build_candidate_lines(source: pd.DataFrame, master: LearnedMaster, cfg: PlannerConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    required = ["NumCommande", "DateCréation", "NomClient", "Article", "QteCommandé", "ResteALivrer"]
-    missing = [c for c in required if c not in source.columns]
-    if missing:
-        raise ValueError("Colonnes source manquantes: " + ", ".join(missing))
+def _priority_score(created: Optional[pd.Timestamp], due: Optional[pd.Timestamp], week_start: pd.Timestamp,
+                    prod_status: str, reservation_flag: str, reserver_br: float, stock: float,
+                    qte_recue: float, remaining: float) -> Tuple[float, int, str]:
+    score = 100.0
+    reasons: List[str] = []
+    overdue_days = 0
+    if due is not None:
+        overdue_days = max(0, (week_start.date() - due.date()).days)
+        days_to_due = (due.date() - week_start.date()).days
+        if overdue_days > 0:
+            score += 2200 + overdue_days * 260
+            reasons.append(f"retard {overdue_days}j")
+        elif days_to_due <= 1:
+            score += 1500
+            reasons.append("échéance immédiate")
+        elif days_to_due <= 5:
+            score += 950 - max(0, days_to_due) * 80
+            reasons.append("échéance semaine")
+        elif days_to_due <= 12:
+            score += 300
+            reasons.append("échéance proche")
+    else:
+        score += 40
+        reasons.append("date non confirmée")
 
+    if created is not None:
+        age = max(0, (week_start.date() - created.date()).days)
+        score += min(650, age * 8)
+        if age > 30:
+            reasons.append("commande ancienne")
+
+    ready = _ready_score(prod_status, reservation_flag, reserver_br, stock, qte_recue, remaining)
+    score += ready
+    if ready >= 350:
+        reasons.append("matière/OF prêt")
+    elif ready < 100:
+        reasons.append("préparation faible")
+
+    return float(score), int(overdue_days), " · ".join(reasons[:4])
+
+
+def build_candidate_lines(source: pd.DataFrame, master: TechnicalMaster, cfg: PlannerConfig) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     week_dates = iso_week_dates(cfg.year, cfg.week)
     week_start = pd.Timestamp(week_dates[0])
-    week_end = pd.Timestamp(week_dates[5])
-
     rows: List[Dict[str, Any]] = []
     excluded = Counter()
-    unknown_colors = Counter()
-    unknown_article_master = 0
+    force_set = {norm_text(x).upper() for x in cfg.force_commands if norm_text(x)}
+    exclude_set = {norm_text(x).upper() for x in cfg.exclude_commands if norm_text(x)}
+    quality = Counter()
 
-    for idx, src in source.iterrows():
-        etat = norm_text(src.get("EtatCommande"))
-        etat_ligne = norm_text(src.get("EtatLigneCommande"))
+    for src_idx, src in source.iterrows():
+        cmd = norm_text(src.get("NumCommande")).upper()
+        if not cmd:
+            excluded["commande vide"] += 1
+            continue
+        if cmd in exclude_set:
+            excluded["exclusion manuelle"] += 1
+            continue
+
+        etat = norm_key(src.get("EtatCommande"))
+        ligne_etat = norm_key(src.get("EtatLigneCommande"))
         remaining = max(0.0, to_float(src.get("ResteALivrer")))
-        if etat and etat.lower() != "commande encours":
+        if etat and "encours" not in etat:
             excluded["commande non encours"] += 1
             continue
-        if etat_ligne and etat_ligne.lower() != "commande encours":
+        if ligne_etat and "encours" not in ligne_etat:
             excluded["ligne non encours"] += 1
             continue
         if remaining <= 0:
@@ -441,131 +497,123 @@ def build_candidate_lines(source: pd.DataFrame, master: LearnedMaster, cfg: Plan
 
         article = norm_text(src.get("Article"))
         article_internal, color = split_article(article)
-        if not color or color == "BRUT":
-            excluded["article sans couleur"] += 1
+        if not article_internal or not color or color == "BRUT":
+            excluded["article/couleur non planifiable"] += 1
             continue
 
         prod_status = norm_text(src.get("ProdStatut"))
-        if "déclaré terminé" in prod_status.lower() or "declare termine" in norm_key(prod_status).replace("_", " "):
-            excluded["production terminée"] += 1
+        if "declare_termine" in norm_key(prod_status) or "declare termine" in norm_key(prod_status).replace("_", " "):
+            excluded["OF terminé"] += 1
             continue
 
         created = parse_date(src.get("DateCréation"))
         due = due_date_from_row(src)
-        qte = max(0.0, to_float(src.get("QteCommandé")))
-        reservation_flag = norm_text(src.get(" 2")).lower() or "non"
+        qte_commanded = max(0.0, to_float(src.get("QteCommandé")))
+        qte_recue = max(0.0, to_float(src.get("QteRèçu")))
+        qte_commence = max(0.0, to_float(src.get("QteCommencé")))
+        qte_restante = max(0.0, to_float(src.get("QteRestante")))
+        reservation_flag = norm_text(src.get(" 2")) or "non"
         reserver_br = max(0.0, to_float(src.get("ReserverBR")))
         stock_phys = max(0.0, to_float(src.get("StockPhysique")))
         reserver = max(0.0, to_float(src.get("Reserver")))
-        qte_recue = max(0.0, to_float(src.get("QteRèçu")))
 
-        unit_weight = max(0.0, to_float(src.get("PoidArticle")))
-        if unit_weight <= 0:
-            unit_weight = master_value(master, article_internal, "PoidsUn", 0.0)
-        exact_bars = master_value(master, article_internal, "Barre/bal", 0.0) > 0
-        bars = infer_bars_per_bal(article_internal, unit_weight, master)
-        if not exact_bars:
-            unknown_article_master += 1
+        direct_weight = max(0.0, to_float(src.get("PoidArticle")))
+        unit_weight, weight_source = infer_unit_weight(article_internal, direct_weight, master)
+        if weight_source == "inconnu":
+            quality["poids_inconnu"] += 1
+        elif weight_source != "source":
+            quality["poids_infere_source"] += 1
 
-        # Quantité à lancer : par défaut strictement le besoin client.
-        # L'historique peut proposer un lot supérieur, mais on le bride pour éviter la surproduction aveugle.
-        launch = remaining
-        if cfg.use_historical_batches and reservation_flag == "non":
-            hist_batch = master_value(master, article_internal, "Batch historique", 0.0)
-            if hist_batch > launch:
-                cap = launch * (1.0 + max(0.0, cfg.max_overproduction_pct) / 100.0)
-                launch = min(hist_batch, cap)
+        bars, bars_source = infer_bars_per_bal(article_internal, unit_weight)
+        if bars_source != "référentiel":
+            quality["barres_estimees"] += 1
 
         relaquage = 0.0
         if cfg.allow_relaquage and stock_phys > 0:
-            # Politique volontairement conservatrice : re-laquage limité au besoin client et à 25 % du lot.
-            relaquage = min(stock_phys, remaining, max(0.0, remaining * 0.25))
-            launch = max(0.0, launch - relaquage)
+            # conservateur: maximum 25% du besoin client et jamais plus que le stock physique.
+            relaquage = min(stock_phys, remaining * 0.25, remaining)
 
-        launch_i = int(round(launch))
-        relaquage_i = int(round(relaquage))
+        launch = max(0.0, remaining - relaquage)
+        launch_i = int(math.ceil(launch - 1e-9))
+        relaq_i = int(math.floor(relaquage + 1e-9))
         nbal = int(math.ceil(launch_i / bars)) if launch_i > 0 and bars > 0 else 0
-        tps = nbal * master.minutes_per_bal / 60.0
-        total_weight = (launch_i + relaquage_i) * unit_weight
-        powder = total_weight * master.powder_coeff
-        nuance = color_nuance(master, color)
-        nuance_known = nuance is not None
+        duration_h = nbal * master.minutes_per_bal / 60.0
+        weight_total = (launch_i + relaq_i) * unit_weight if unit_weight > 0 else 0.0
+        powder = weight_total * master.powder_coeff
+        nuance, nuance_known = color_nuance(color)
         if not nuance_known:
-            unknown_colors[color] += 1
+            quality["nuance_inconnue"] += 1
 
-        age_days = max(0, (week_start - created.normalize()).days) if created is not None else 0
-        overdue_days = max(0, (week_start - due.normalize()).days) if due is not None else 0
-        due_in_week = bool(due is not None and due.normalize() <= week_end)
-        days_after_week = max(0, (due.normalize() - week_end).days) if due is not None else 999
-        readiness = status_ready_score(prod_status, reservation_flag, reserver_br, stock_phys, qte_recue)
-
-        # Score explicable : délai > disponibilité > ancienneté > valeur.
-        priority_score = (
-            min(900.0, overdue_days * 18.0)
-            + (300.0 if due_in_week else max(0.0, 120.0 - days_after_week * 4.0))
-            + min(180.0, age_days * 1.5)
-            + readiness
-            + min(80.0, math.log1p(max(0.0, to_float(src.get("ValeurEncours")))) * 5.0)
+        priority, overdue_days, reason = _priority_score(
+            created, due, week_start, prod_status, reservation_flag, reserver_br,
+            stock_phys, qte_recue, remaining
         )
+        if cmd in force_set:
+            priority += 100000
+            reason = "FORCÉ · " + reason
 
-        line_id = f"{norm_text(src.get('NumCommande'))}|{article}|{norm_text(src.get('NumOF'))}|{idx}"
+        line_id = hashlib.sha1(
+            f"{src_idx}|{cmd}|{article}|{norm_text(src.get('NumOF'))}".encode("utf-8")
+        ).hexdigest()[:16]
+
         rows.append({
-            "_line_id": line_id,
-            "_source_index": int(idx),
-            "NumCommande": norm_text(src.get("NumCommande")),
+            "NumCommande": cmd,
             "DateCréation": created.to_pydatetime() if created is not None else None,
             "NomClient": norm_text(src.get("NomClient")),
             "Article": article,
             "Article/int": article_internal,
             "Couleur": color,
-            "Nuance": nuance if nuance is not None else "",
-            "QteCommandé": qte,
-            "ResteALivrer": remaining,
-            "Prelevé": to_float(src.get("Prelevé"), np.nan) if norm_text(src.get("Prelevé")) else None,
+            "Nuance": round(float(nuance), 2),
+            "QteCommandé": int(round(qte_commanded)),
+            "ResteALivrer": int(round(remaining)),
+            "Prelevé": to_int(src.get("Prelevé")),
             "reservation brut": reservation_flag,
             "NumOF": norm_text(src.get("NumOF")),
             "ProdStatut": prod_status,
-            "QteCommencé": to_float(src.get("QteCommencé"), np.nan) if norm_text(src.get("QteCommencé")) else None,
-            "QteRestante": to_float(src.get("QteRestante"), np.nan) if norm_text(src.get("QteRestante")) else None,
-            "QteRèçu": to_float(src.get("QteRèçu"), np.nan) if norm_text(src.get("QteRèçu")) else None,
-            "ReserverBR": reserver_br,
-            "StockPhysique": stock_phys,
-            "Reserver": to_float(src.get("Reserver"), np.nan) if norm_text(src.get("Reserver")) else None,
+            "QteCommencé": int(round(qte_commence)),
+            "QteRestante": int(round(qte_restante)),
+            "QteRèçu": int(round(qte_recue)),
+            "ReserverBR": int(round(reserver_br)),
+            "StockPhysique": int(round(stock_phys)),
+            "Reserver": int(round(reserver)),
             "Lancement": launch_i,
-            "Re-laquage": relaquage_i if relaquage_i else None,
-            "PoidsUn": unit_weight,
-            "PoidsT": total_weight,
-            "Poudre": powder,
-            "Barre/bal": bars,
-            "Nbre Bal": nbal,
-            "tps": tps,
-            "Stock brut": master_value(master, article_internal, "Stock brut", 0.0),
+            "Re-laquage": relaq_i,
+            "PoidsUn": round(unit_weight, 4),
+            "PoidsT": round(weight_total, 3),
+            "Poudre": round(powder, 3),
+            "Barre/bal": int(bars),
+            "Nbre Bal": int(nbal),
+            "tps": round(duration_h, 4),
+            "Stock brut": int(round(reserver_br)),
+            "_line_id": line_id,
+            "_source_index": int(src_idx),
             "_due": due.to_pydatetime() if due is not None else None,
-            "_score": float(priority_score),
-            "_ready": float(readiness),
-            "_overdue_days": int(overdue_days),
-            "_bars_exact": bool(exact_bars),
-            "_nuance_known": bool(nuance_known),
-            "_weight_known": bool(unit_weight > 0),
+            "_score": round(priority, 3),
+            "_overdue_days": overdue_days,
+            "_reason": reason,
+            "_forced": cmd in force_set,
+            "_weight_source": weight_source,
+            "_bars_source": bars_source,
+            "_nuance_known": nuance_known,
         })
 
     df = pd.DataFrame(rows)
-    quality = {
+    if not df.empty:
+        df = df.sort_values(["_score", "_due", "DateCréation"], ascending=[False, True, True], na_position="last").reset_index(drop=True)
+
+    info = {
         "source_rows": int(len(source)),
         "eligible_lines": int(len(df)),
         "excluded": dict(excluded),
-        "unknown_color_lines": int(sum(unknown_colors.values())),
-        "unknown_colors": dict(unknown_colors),
-        "inferred_article_parameters": int(unknown_article_master),
-        "powder_coeff": round(master.powder_coeff, 6),
-        "minutes_per_bal": round(master.minutes_per_bal, 4),
+        "quality": dict(quality),
+        "source_weight_samples": master.source_weight_samples,
     }
-    return df, quality
+    return df, info
 
 
-# -----------------------------------------------------------------------------
-# Agent 4 — Regroupement en jobs cohérents commande + couleur
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 6) AGENT JOBS — cohérence commande + couleur
+# =============================================================================
 @dataclass
 class Job:
     job_id: str
@@ -576,27 +624,43 @@ class Job:
     score: float
     due: Optional[datetime]
     created: Optional[datetime]
+    forced: bool = False
+
+
+def _make_job(cmd: str, color: str, idxs: List[int], sub: pd.DataFrame, chunk_no: int) -> Job:
+    dues = [x for x in sub["_due"].tolist() if x is not None and not pd.isna(x)]
+    created = [x for x in sub["DateCréation"].tolist() if x is not None and not pd.isna(x)]
+    return Job(
+        job_id=f"{cmd}|{color}|{chunk_no}",
+        line_indices=list(idxs),
+        command=str(cmd),
+        color=str(color),
+        duration_min=max(1, int(round(pd.to_numeric(sub["tps"], errors="coerce").fillna(0).sum() * 60))),
+        score=float(sub["_score"].max() + min(400.0, sub["_score"].mean() * 0.04) + len(sub) * 3),
+        due=min(dues) if dues else None,
+        created=min(created) if created else None,
+        forced=bool(sub["_forced"].any()),
+    )
 
 
 def build_jobs(lines: pd.DataFrame, cfg: PlannerConfig) -> Tuple[List[Job], List[int]]:
     if lines.empty:
         return [], []
-    capacity_min = int(round(cfg.capacity_h * 60))
+    max_day_cap = max(day_capacity_min(cfg, d) for d in range(6))
     jobs: List[Job] = []
     oversized: List[int] = []
 
     for (cmd, color), g in lines.groupby(["NumCommande", "Couleur"], sort=False):
-        # même commande/couleur reste ensemble autant que possible ; on fractionne seulement si > capacité journalière.
-        g = g.sort_values(["_score", "DateCréation"], ascending=[False, True], na_position="last")
+        g = g.sort_values(["_score", "_due"], ascending=[False, True], na_position="last")
         chunk: List[int] = []
         chunk_min = 0
         chunk_no = 1
         for i, r in g.iterrows():
-            mins = max(0, int(round(to_float(r["tps"]) * 60)))
-            if mins > capacity_min:
+            mins = max(1, int(round(to_float(r["tps"]) * 60)))
+            if mins > max_day_cap:
                 oversized.append(int(i))
                 continue
-            if chunk and chunk_min + mins > capacity_min:
+            if chunk and chunk_min + mins > max_day_cap:
                 sub = lines.loc[chunk]
                 jobs.append(_make_job(cmd, color, chunk, sub, chunk_no))
                 chunk_no += 1
@@ -605,82 +669,72 @@ def build_jobs(lines: pd.DataFrame, cfg: PlannerConfig) -> Tuple[List[Job], List
             chunk.append(int(i))
             chunk_min += mins
         if chunk:
-            sub = lines.loc[chunk]
-            jobs.append(_make_job(cmd, color, chunk, sub, chunk_no))
+            jobs.append(_make_job(cmd, color, chunk, lines.loc[chunk], chunk_no))
     return jobs, oversized
 
 
-def _make_job(cmd: str, color: str, idxs: List[int], sub: pd.DataFrame, chunk_no: int) -> Job:
-    due_vals = [x for x in sub["_due"].tolist() if x is not None and not pd.isna(x)]
-    created_vals = [x for x in sub["DateCréation"].tolist() if x is not None and not pd.isna(x)]
-    return Job(
-        job_id=f"{cmd}|{color}|{chunk_no}",
-        line_indices=list(idxs),
-        command=str(cmd),
-        color=str(color),
-        duration_min=int(round(pd.to_numeric(sub["tps"], errors="coerce").fillna(0).sum() * 60)),
-        score=float(sub["_score"].max() + min(150.0, sub["_score"].mean() * 0.08) + len(sub) * 2.0),
-        due=min(due_vals) if due_vals else None,
-        created=min(created_vals) if created_vals else None,
-    )
-
-
 def select_candidate_pool(jobs: List[Job], cfg: PlannerConfig) -> Tuple[List[Job], List[Job]]:
-    total_cap = cfg.capacity_h * 60 * 6
-    ordered = sorted(jobs, key=lambda j: (-j.score, j.due or datetime.max, j.created or datetime.max, j.duration_min))
+    week_capacity = sum(day_capacity_min(cfg, d) for d in range(6))
+    ordered = sorted(jobs, key=lambda j: (not j.forced, -j.score, j.due or datetime.max, j.created or datetime.max, j.duration_min))
     selected: List[Job] = []
     minutes = 0
-    target = total_cap * max(1.5, cfg.pool_factor)
-    for j in ordered:
+    target = week_capacity * max(1.6, cfg.pool_factor)
+    for job in ordered:
         if len(selected) >= cfg.max_jobs:
             break
-        selected.append(j)
-        minutes += j.duration_min
-        if minutes >= target and len(selected) >= 250:
+        selected.append(job)
+        minutes += job.duration_min
+        if minutes >= target and len(selected) >= 300:
             break
     selected_ids = {j.job_id for j in selected}
     outside = [j for j in jobs if j.job_id not in selected_ids]
     return selected, outside
 
 
-# -----------------------------------------------------------------------------
-# Agent 5 — Affectation OR-Tools CP-SAT / fallback
-# -----------------------------------------------------------------------------
-STRATEGY_WEIGHTS = {
-    "Équilibre": {"unscheduled": 100, "late": 40, "color": 32, "balance": 2, "early": 1},
-    "Délais clients": {"unscheduled": 130, "late": 90, "color": 18, "balance": 1, "early": 0},
-    "Rendement couleurs": {"unscheduled": 95, "late": 30, "color": 70, "balance": 2, "early": 1},
+# =============================================================================
+# 7) AGENT PLANIFICATEUR — OR-Tools + mono-couleur prioritaire
+# =============================================================================
+SCENARIO_WEIGHTS = {
+    "Délais clients": {"unscheduled": 180, "late": 180, "two_color": 80, "color": 15, "balance": 1, "split": 20, "early": 0},
+    "Mono-couleur": {"unscheduled": 125, "late": 90, "two_color": 250000, "color": 90, "balance": 1, "split": 35, "early": 1},
+    "Équilibre": {"unscheduled": 150, "late": 125, "two_color": 230, "color": 45, "balance": 2, "split": 28, "early": 1},
 }
 
 
-def _job_priority_penalty(job: Job) -> int:
-    return max(1000, int(round(10000 + job.score * 120 + min(900, job.duration_min) * 4)))
+def _job_unscheduled_penalty(job: Job) -> int:
+    return max(10000, int(round(25000 + job.score * 150 + min(900, job.duration_min) * 8)))
 
 
 def assign_jobs_ortools(jobs: List[Job], cfg: PlannerConfig) -> Tuple[Dict[str, int], List[str], str]:
     if not ORTOOLS_AVAILABLE or not jobs:
         return {}, [], ""
-    w = STRATEGY_WEIGHTS.get(cfg.strategy, STRATEGY_WEIGHTS["Équilibre"])
+
+    w = SCENARIO_WEIGHTS.get(cfg.strategy, SCENARIO_WEIGHTS["Équilibre"])
     week_dates = iso_week_dates(cfg.year, cfg.week)
-    cap = int(round(cfg.capacity_h * 60))
     colors = sorted({j.color for j in jobs})
-    by_color = defaultdict(list)
+    commands = sorted({j.command for j in jobs})
+    by_color: Dict[str, List[int]] = defaultdict(list)
+    by_command: Dict[str, List[int]] = defaultdict(list)
     for ji, job in enumerate(jobs):
         by_color[job.color].append(ji)
+        by_command[job.command].append(ji)
 
     model = cp_model.CpModel()
     x: Dict[Tuple[int, int], Any] = {}
     u: Dict[int, Any] = {}
     y: Dict[Tuple[int, str], Any] = {}
-    loads: Dict[int, Any] = {}
     objective: List[Any] = []
 
     for ji, job in enumerate(jobs):
         u[ji] = model.NewBoolVar(f"u_{ji}")
         for d in range(6):
             x[(ji, d)] = model.NewBoolVar(f"x_{ji}_{d}")
+            if day_capacity_min(cfg, d) <= 0:
+                model.Add(x[(ji, d)] == 0)
         model.Add(sum(x[(ji, d)] for d in range(6)) + u[ji] == 1)
-        objective.append(u[ji] * _job_priority_penalty(job) * w["unscheduled"])
+        if job.forced:
+            model.Add(u[ji] == 0)
+        objective.append(u[ji] * _job_unscheduled_penalty(job) * w["unscheduled"])
 
         if job.due is not None:
             due_d = job.due.date()
@@ -688,37 +742,63 @@ def assign_jobs_ortools(jobs: List[Job], cfg: PlannerConfig) -> Tuple[Dict[str, 
                 late = max(0, (week_dates[d] - due_d).days)
                 early = max(0, (due_d - week_dates[d]).days - 2)
                 if late:
-                    objective.append(x[(ji, d)] * late * w["late"] * 100)
+                    objective.append(x[(ji, d)] * late * w["late"] * 140)
                 if early and w["early"]:
-                    objective.append(x[(ji, d)] * early * w["early"] * 8)
+                    objective.append(x[(ji, d)] * early * w["early"] * 10)
 
     for d in range(6):
-        for c in colors:
-            y[(d, c)] = model.NewBoolVar(f"y_{d}_{norm_key(c)}")
-            for ji in by_color[c]:
-                model.Add(x[(ji, d)] <= y[(d, c)])
-            objective.append(y[(d, c)] * w["color"] * 100)
-        model.Add(sum(y[(d, c)] for c in colors) <= max(1, cfg.max_colors_per_day))
+        cap = day_capacity_min(cfg, d)
+        if cap <= 0:
+            continue
+        active = []
+        for color in colors:
+            y[(d, color)] = model.NewBoolVar(f"y_{d}_{norm_key(color)}")
+            idxs = by_color[color]
+            for ji in idxs:
+                model.Add(x[(ji, d)] <= y[(d, color)])
+            model.Add(y[(d, color)] <= sum(x[(ji, d)] for ji in idxs))
+            active.append(y[(d, color)])
+            objective.append(y[(d, color)] * w["color"] * 100)
 
-        load = model.NewIntVar(0, cap + max(0, cfg.cleaning_min), f"load_{d}")
-        model.Add(load == sum(jobs[ji].duration_min * x[(ji, d)] for ji in range(len(jobs))))
-        loads[d] = load
-        # 1re couleur gratuite, chaque couleur supplémentaire réserve cleaning_min minutes.
-        if cfg.cleaning_min > 0:
-            model.Add(load + cfg.cleaning_min * sum(y[(d, c)] for c in colors) <= cap + cfg.cleaning_min)
-        else:
-            model.Add(load <= cap)
+        n_colors = sum(active)
+        color_limit = PREFERRED_COLORS_PER_DAY if cfg.strategy == "Mono-couleur" else HARD_MAX_COLORS_PER_DAY
+        model.Add(n_colors <= color_limit)
+        second_color = model.NewBoolVar(f"second_color_{d}")
+        model.Add(n_colors <= 1 + second_color)
+        objective.append(second_color * w["two_color"] * 1000)
 
-        target = int(round(cap * 0.94))
+        prod = sum(jobs[ji].duration_min * x[(ji, d)] for ji in range(len(jobs)))
+        model.Add(prod + cfg.cleaning_min * second_color <= cap)
+
+        target = int(round(cap * cfg.target_utilization))
+        load = model.NewIntVar(0, cap, f"load_{d}")
+        model.Add(load == prod + cfg.cleaning_min * second_color)
         dev = model.NewIntVar(0, cap, f"dev_{d}")
         model.Add(dev >= target - load)
         model.Add(dev >= load - target)
         objective.append(dev * w["balance"])
 
+    # même commande: limiter la dispersion sur plusieurs jours.
+    for ci, cmd in enumerate(commands):
+        idxs = by_command[cmd]
+        if len(idxs) <= 1:
+            continue
+        presents = []
+        for d in range(6):
+            p = model.NewBoolVar(f"cmd_{ci}_{d}")
+            for ji in idxs:
+                model.Add(x[(ji, d)] <= p)
+            model.Add(p <= sum(x[(ji, d)] for ji in idxs))
+            presents.append(p)
+        extra = model.NewIntVar(0, 5, f"split_{ci}")
+        model.Add(extra >= sum(presents) - 1)
+        objective.append(extra * w["split"] * 500)
+
     model.Minimize(sum(objective))
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = max(2.0, float(cfg.solver_seconds))
+    solver.parameters.max_time_in_seconds = max(3.0, float(cfg.solver_seconds))
     solver.parameters.num_search_workers = max(1, min(8, os.cpu_count() or 2))
+    solver.parameters.random_seed = 36
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return {}, [], ""
@@ -729,55 +809,76 @@ def assign_jobs_ortools(jobs: List[Job], cfg: PlannerConfig) -> Tuple[Dict[str, 
         if solver.Value(u[ji]):
             unscheduled.append(job.job_id)
             continue
-        placed = False
         for d in range(6):
             if solver.Value(x[(ji, d)]):
                 assignments[job.job_id] = d
-                placed = True
                 break
-        if not placed:
+        if job.job_id not in assignments:
             unscheduled.append(job.job_id)
-    return assignments, unscheduled, "OR-Tools CP-SAT"
+    return assignments, unscheduled, "OR-Tools CP-SAT Agentic"
+
+
+def _fallback_day_cost(job: Job, d: int, loads: List[int], colors_by_day: List[set], commands_by_day: List[set], cfg: PlannerConfig) -> float:
+    cap = day_capacity_min(cfg, d)
+    if cap <= 0:
+        return float("inf")
+    new_color = job.color not in colors_by_day[d]
+    ncolors = len(colors_by_day[d]) + (1 if new_color else 0)
+    if ncolors > HARD_MAX_COLORS_PER_DAY:
+        return float("inf")
+    cleaning = cfg.cleaning_min if ncolors == 2 else 0
+    current_cleaning = cfg.cleaning_min if len(colors_by_day[d]) == 2 else 0
+    projected = loads[d] - current_cleaning + job.duration_min + cleaning
+    if projected > cap:
+        return float("inf")
+
+    week_day = iso_week_dates(cfg.year, cfg.week)[d]
+    late = max(0, (week_day - job.due.date()).days) if job.due else 0
+    mono_pen = 0
+    if not colors_by_day[d]:
+        mono_pen = 80
+    elif new_color:
+        # En mode mono-couleur, une deuxième couleur n’est utilisée qu’en dernier recours.
+        mono_pen = 1_000_000_000 if cfg.strategy == "Mono-couleur" else 120_000
+    else:
+        mono_pen = -25_000
+    due_pen = late * (45000 if cfg.strategy == "Délais clients" else 28000)
+    group_bonus = -2500 if job.command in commands_by_day[d] else 0
+    target = cap * cfg.target_utilization
+    balance_pen = abs(target - projected) * (2 if cfg.strategy == "Équilibre" else 1)
+    return due_pen + mono_pen + balance_pen + group_bonus - job.score * 5
 
 
 def assign_jobs_fallback(jobs: List[Job], cfg: PlannerConfig) -> Tuple[Dict[str, int], List[str], str]:
-    week_dates = iso_week_dates(cfg.year, cfg.week)
-    cap = int(round(cfg.capacity_h * 60))
     loads = [0] * 6
     colors_by_day: List[set] = [set() for _ in range(6)]
+    commands_by_day: List[set] = [set() for _ in range(6)]
     assignments: Dict[str, int] = {}
     unscheduled: List[str] = []
-    w = STRATEGY_WEIGHTS.get(cfg.strategy, STRATEGY_WEIGHTS["Équilibre"])
+    ordered = sorted(jobs, key=lambda j: (not j.forced, -j.score, j.due or datetime.max, -j.duration_min))
 
-    ordered = sorted(jobs, key=lambda j: (-j.score, j.due or datetime.max, -j.duration_min))
     for job in ordered:
         options = []
         for d in range(6):
-            new_color = job.color not in colors_by_day[d]
-            color_count = len(colors_by_day[d]) + (1 if new_color else 0)
-            if color_count > cfg.max_colors_per_day:
+            if cfg.strategy == "Mono-couleur" and colors_by_day[d] and job.color not in colors_by_day[d]:
                 continue
-            clean_extra = cfg.cleaning_min if new_color and len(colors_by_day[d]) > 0 else 0
-            if loads[d] + job.duration_min + clean_extra > cap:
-                continue
-            due_pen = 0.0
-            if job.due is not None:
-                late = max(0, (week_dates[d] - job.due.date()).days)
-                early = max(0, (job.due.date() - week_dates[d]).days - 2)
-                due_pen = late * w["late"] * 100 + early * w["early"] * 8
-            color_pen = (w["color"] * 100) if new_color else -w["color"] * 140
-            # léger bonus au jour déjà proche de 90-95 % de charge, sans dépasser.
-            projected = loads[d] + job.duration_min + clean_extra
-            balance_pen = abs(int(cap * 0.94) - projected) * w["balance"]
-            options.append((due_pen + color_pen + balance_pen, d, clean_extra))
+            cost = _fallback_day_cost(job, d, loads, colors_by_day, commands_by_day, cfg)
+            if math.isfinite(cost):
+                options.append((cost, d))
         if not options:
             unscheduled.append(job.job_id)
             continue
-        _, d, clean_extra = min(options, key=lambda x: (x[0], x[1]))
-        assignments[job.job_id] = d
-        loads[d] += job.duration_min + clean_extra
+        _, d = min(options, key=lambda x: (x[0], x[1]))
+        before_n = len(colors_by_day[d])
         colors_by_day[d].add(job.color)
-    return assignments, unscheduled, "Heuristique agentique de secours"
+        after_n = len(colors_by_day[d])
+        if before_n < 2 <= after_n:
+            loads[d] += cfg.cleaning_min
+        loads[d] += job.duration_min
+        commands_by_day[d].add(job.command)
+        assignments[job.job_id] = d
+
+    return assignments, unscheduled, "Heuristique Agentic robuste"
 
 
 def assign_jobs(jobs: List[Job], cfg: PlannerConfig) -> Tuple[Dict[str, int], List[str], str]:
@@ -788,197 +889,160 @@ def assign_jobs(jobs: List[Job], cfg: PlannerConfig) -> Tuple[Dict[str, int], Li
     return assign_jobs_fallback(jobs, cfg)
 
 
-# -----------------------------------------------------------------------------
-# Agent 6 — Séquençage couleurs et lignes
-# -----------------------------------------------------------------------------
-
-def color_distance(c1: str, c2: str, master: LearnedMaster) -> float:
-    n1, n2 = color_nuance(master, c1), color_nuance(master, c2)
-    if n1 is None or n2 is None:
-        return 12.0 if c1 != c2 else 0.0
-    return abs(float(n1) - float(n2))
-
-
-def order_colors(colors: Sequence[str], master: LearnedMaster, previous_color: Optional[str] = None) -> List[str]:
-    remaining = list(dict.fromkeys(colors))
-    if not remaining:
-        return []
-    if previous_color:
-        current = min(remaining, key=lambda c: (color_distance(previous_color, c, master), c))
-    else:
-        known = [(color_nuance(master, c), c) for c in remaining]
-        known_sorted = [(n, c) for n, c in known if n is not None]
-        current = min(known_sorted)[1] if known_sorted else sorted(remaining)[0]
-    out = [current]
-    remaining.remove(current)
-    while remaining:
-        nxt = min(remaining, key=lambda c: (color_distance(current, c, master), c))
-        out.append(nxt)
-        remaining.remove(nxt)
-        current = nxt
-    return out
+# =============================================================================
+# 8) AGENT RÉPARATION — mono-couleur + backlog urgent
+# =============================================================================
+def _state_from_assignments(jobs: List[Job], assignments: Dict[str, int], cfg: PlannerConfig):
+    by_id = {j.job_id: j for j in jobs}
+    loads = [0] * 6
+    colors: List[set] = [set() for _ in range(6)]
+    day_jobs: List[List[str]] = [[] for _ in range(6)]
+    for jid, d in assignments.items():
+        j = by_id[jid]
+        day_jobs[d].append(jid)
+        loads[d] += j.duration_min
+        colors[d].add(j.color)
+    for d in range(6):
+        if len(colors[d]) == 2:
+            loads[d] += cfg.cleaning_min
+    return by_id, loads, colors, day_jobs
 
 
-def sequence_days(lines: pd.DataFrame, jobs: List[Job], assignments: Dict[str, int], master: LearnedMaster) -> Dict[int, pd.DataFrame]:
+def _can_place(job: Job, d: int, loads: List[int], colors: List[set], cfg: PlannerConfig, remove_job: Optional[Job] = None) -> bool:
+    cap = day_capacity_min(cfg, d)
+    if cap <= 0:
+        return False
+    current_colors = set(colors[d])
+    current_load = loads[d]
+    if remove_job is not None:
+        current_load -= remove_job.duration_min
+        # exact color recalculation requires day job list; caller only uses remove_job from same color swap conservatively.
+    new_colors = set(current_colors)
+    new_colors.add(job.color)
+    if len(new_colors) > HARD_MAX_COLORS_PER_DAY:
+        return False
+    # cleaning state estimated conservatively: if 2 colors after placement, reserve cleaning.
+    clean_after = cfg.cleaning_min if len(new_colors) == 2 else 0
+    clean_before = cfg.cleaning_min if len(current_colors) == 2 else 0
+    prod_before = current_load - clean_before
+    return prod_before + job.duration_min + clean_after <= cap + 1e-9
+
+
+def repair_assignments(jobs: List[Job], assignments: Dict[str, int], unscheduled: List[str], cfg: PlannerConfig) -> Tuple[Dict[str, int], List[str], List[str]]:
+    assignments = dict(assignments)
+    unscheduled_set = set(unscheduled)
+    log: List[str] = []
+    by_id = {j.job_id: j for j in jobs}
+
+    # Boucle 1: essayer de transformer les jours à 2 couleurs en jours mono-couleur.
+    for _ in range(4):
+        changed = False
+        by_id, loads, colors, day_jobs = _state_from_assignments(jobs, assignments, cfg)
+        for d in range(6):
+            if len(colors[d]) != 2:
+                continue
+            color_minutes = Counter()
+            for jid in day_jobs[d]:
+                j = by_id[jid]
+                color_minutes[j.color] += j.duration_min
+            minority = min(color_minutes, key=color_minutes.get)
+            move_ids = [jid for jid in day_jobs[d] if by_id[jid].color == minority and not by_id[jid].forced]
+            # on ne déplace la couleur minoritaire que si toutes ses lignes peuvent aller ensemble ailleurs.
+            moved_to = None
+            for target in range(6):
+                if target == d or day_capacity_min(cfg, target) <= 0:
+                    continue
+                target_colors = colors[target]
+                if target_colors and minority not in target_colors:
+                    continue  # mono-couleur privilégiée: pas créer un nouveau 2e coloris ici.
+                total = sum(by_id[jid].duration_min for jid in move_ids)
+                clean_before = cfg.cleaning_min if len(target_colors) == 2 else 0
+                prod_target = loads[target] - clean_before
+                projected_colors = set(target_colors) | ({minority} if move_ids else set())
+                clean_after = cfg.cleaning_min if len(projected_colors) == 2 else 0
+                if prod_target + total + clean_after <= day_capacity_min(cfg, target):
+                    moved_to = target
+                    break
+            if moved_to is not None and move_ids:
+                for jid in move_ids:
+                    assignments[jid] = moved_to
+                log.append(f"Réduction couleur: {minority} déplacée de {DAYS[d]} vers {DAYS[moved_to]} pour obtenir un jour mono-couleur.")
+                changed = True
+                break
+        if not changed:
+            break
+
+    # Boucle 2: récupérer les jobs en retard / forte priorité si une place compatible existe.
+    for _ in range(8):
+        if not unscheduled_set:
+            break
+        by_id, loads, colors, day_jobs = _state_from_assignments(jobs, assignments, cfg)
+        backlog = sorted((by_id[jid] for jid in unscheduled_set if jid in by_id), key=lambda j: (not j.forced, -j.score, j.due or datetime.max))
+        changed = False
+        for job in backlog[:120]:
+            candidates = []
+            for d in range(6):
+                if day_capacity_min(cfg, d) <= 0:
+                    continue
+                # préférence absolue même couleur, puis jour vide. En scénario Mono-couleur,
+                # l'agent de réparation n'a pas le droit de réintroduire une 2e couleur.
+                if cfg.strategy == "Mono-couleur" and colors[d] and job.color not in colors[d]:
+                    continue
+                color_class = 0 if job.color in colors[d] else 1 if not colors[d] else 2
+                if _can_place(job, d, loads, colors, cfg):
+                    planned_date = iso_week_dates(cfg.year, cfg.week)[d]
+                    late = max(0, (planned_date - job.due.date()).days) if job.due else 0
+                    candidates.append((late, color_class, loads[d], d))
+            if candidates:
+                _, _, _, d = min(candidates)
+                assignments[job.job_id] = d
+                unscheduled_set.remove(job.job_id)
+                log.append(f"Backlog récupéré: {job.command} / {job.color} placé {DAYS[d]}.")
+                changed = True
+                break
+        if not changed:
+            break
+
+    return assignments, sorted(unscheduled_set), log
+
+
+# =============================================================================
+# 9) AGENT COULEURS / SÉQUENÇAGE
+# =============================================================================
+def order_colors(colors: Sequence[str]) -> List[str]:
+    unique = list(dict.fromkeys(norm_text(c).upper() for c in colors if norm_text(c)))
+    return sorted(unique, key=lambda c: (color_nuance(c)[0], c))
+
+
+def sequence_days(lines: pd.DataFrame, jobs: List[Job], assignments: Dict[str, int]) -> Dict[int, pd.DataFrame]:
     job_map = {j.job_id: j for j in jobs}
     day_indices: Dict[int, List[int]] = {d: [] for d in range(6)}
     for jid, d in assignments.items():
-        j = job_map[jid]
-        day_indices[d].extend(j.line_indices)
+        if jid in job_map:
+            day_indices[d].extend(job_map[jid].line_indices)
 
     result: Dict[int, pd.DataFrame] = {}
-    prev_color: Optional[str] = None
     for d in range(6):
         if not day_indices[d]:
             result[d] = lines.iloc[0:0].copy()
             continue
         df = lines.loc[day_indices[d]].copy()
-        c_order = order_colors(df["Couleur"].tolist(), master, prev_color)
-        c_rank = {c: i for i, c in enumerate(c_order)}
-        df["_color_rank"] = df["Couleur"].map(c_rank).fillna(999)
+        route = order_colors(df["Couleur"].tolist())
+        rank = {c: i for i, c in enumerate(route)}
+        df["_color_rank"] = df["Couleur"].astype(str).str.upper().map(rank).fillna(999)
         df["_due_sort"] = pd.to_datetime(df["_due"], errors="coerce")
-        df["_created_sort"] = pd.to_datetime(df["DateCréation"], errors="coerce")
-        # couleur -> délai -> commande -> article : stable et facile à utiliser à l'atelier.
         df = df.sort_values(
-            ["_color_rank", "_due_sort", "NumCommande", "_created_sort", "Article"],
-            ascending=[True, True, True, True, True], na_position="last"
-        )
-        df = df.drop(columns=["_color_rank", "_due_sort", "_created_sort"])
+            ["_color_rank", "_due_sort", "_score", "NumCommande", "Article"],
+            ascending=[True, True, False, True, True], na_position="last"
+        ).drop(columns=["_color_rank", "_due_sort"]).reset_index(drop=True)
+        df["_planned_day"] = DAYS[d]
         result[d] = df
-        if c_order:
-            prev_color = c_order[-1]
     return result
 
 
-# -----------------------------------------------------------------------------
-# Agent 7/8 — Critique, réparation légère et rapport
-# -----------------------------------------------------------------------------
-
-def planning_metrics(days: Dict[int, pd.DataFrame], cfg: PlannerConfig) -> Dict[str, Any]:
-    day_metrics = []
-    total = 0.0
-    total_changes = 0
-    for d in range(6):
-        df = days[d]
-        tps = float(pd.to_numeric(df.get("tps", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
-        colors = list(dict.fromkeys(df.get("Couleur", pd.Series(dtype=str)).dropna().astype(str).tolist()))
-        changes = max(0, len(colors) - 1)
-        load_with_clean = tps + changes * cfg.cleaning_min / 60.0
-        total += load_with_clean
-        total_changes += changes
-        day_metrics.append({
-            "Jour": DAYS[d],
-            "Charge production h": round(tps, 2),
-            "Nettoyage h": round(changes * cfg.cleaning_min / 60.0, 2),
-            "Charge totale h": round(load_with_clean, 2),
-            "Capacité h": round(cfg.capacity_h, 2),
-            "Charge %": round(load_with_clean / cfg.capacity_h * 100, 1) if cfg.capacity_h else 0,
-            "Couleurs": " → ".join(colors),
-            "Nb couleurs": len(colors),
-            "Lignes": len(df),
-        })
-    return {
-        "days": day_metrics,
-        "total_load_h": round(total, 2),
-        "capacity_h": round(cfg.capacity_h * 6, 2),
-        "utilization_pct": round(total / (cfg.capacity_h * 6) * 100, 1) if cfg.capacity_h else 0,
-        "color_changes": total_changes,
-    }
-
-
-def critic_report(days: Dict[int, pd.DataFrame], unscheduled: pd.DataFrame, quality: Dict[str, Any], cfg: PlannerConfig) -> Tuple[List[str], int]:
-    warnings: List[str] = []
-    metrics = planning_metrics(days, cfg)
-    planned = pd.concat([d for d in days.values() if d is not None and not d.empty], ignore_index=True) if any(not d.empty for d in days.values()) else pd.DataFrame()
-    for dm in metrics["days"]:
-        if dm["Charge totale h"] > dm["Capacité h"] + 1e-6:
-            warnings.append(f"{dm['Jour']}: surcharge {dm['Charge totale h']:.2f} h / {dm['Capacité h']:.2f} h")
-        if dm["Nb couleurs"] > cfg.max_colors_per_day:
-            warnings.append(f"{dm['Jour']}: trop de couleurs ({dm['Nb couleurs']}).")
-
-    planned_unknown_color = int((~planned.get("_nuance_known", pd.Series(True, index=planned.index)).astype(bool)).sum()) if not planned.empty else 0
-    planned_inferred_bars = int((~planned.get("_bars_exact", pd.Series(True, index=planned.index)).astype(bool)).sum()) if not planned.empty else 0
-    planned_missing_weight = int((~planned.get("_weight_known", pd.Series(True, index=planned.index)).astype(bool)).sum()) if not planned.empty else 0
-    if planned_unknown_color:
-        warnings.append(f"{planned_unknown_color} ligne(s) planifiée(s) ont une nuance couleur inconnue; le regroupement reste exact, l'ordre de transition est estimé.")
-    if planned_inferred_bars:
-        warnings.append(f"{planned_inferred_bars} ligne(s) planifiée(s) utilisent une estimation Barre/bal faute de référence historique exacte.")
-    if planned_missing_weight:
-        warnings.append(f"{planned_missing_weight} ligne(s) planifiée(s) n'ont pas de PoidsUn fiable; PoidsT/Poudre doivent être vérifiés.")
-    if not unscheduled.empty:
-        overdue_uns = int((pd.to_numeric(unscheduled.get("_overdue_days"), errors="coerce").fillna(0) > 0).sum())
-        if overdue_uns:
-            warnings.append(f"{overdue_uns} ligne(s) en retard restent hors semaine faute de capacité/priorité relative.")
-
-    confidence = 100
-    nplan = max(1, len(planned))
-    confidence -= min(20, int(planned_unknown_color / nplan * 45))
-    confidence -= min(18, int(planned_inferred_bars / nplan * 35))
-    confidence -= min(25, int(planned_missing_weight / nplan * 80))
-    # Un backlog en retard n'est pas une erreur du plan si la capacité est saturée; pénalité légère seulement.
-    if warnings:
-        confidence -= min(12, len(warnings) * 2)
-    return warnings, max(40, confidence)
-
-
-# -----------------------------------------------------------------------------
-# Orchestrateur agentique
-# -----------------------------------------------------------------------------
-def generate_agentic_plan(source: pd.DataFrame, history: Optional[pd.DataFrame], cfg: PlannerConfig) -> Dict[str, Any]:
-    master = learn_master(history)
-    lines, quality = build_candidate_lines(source, master, cfg)
-    jobs, oversized_idxs = build_jobs(lines, cfg)
-    selected_jobs, outside_jobs = select_candidate_pool(jobs, cfg)
-    assignments, unsched_ids, engine = assign_jobs(selected_jobs, cfg)
-    days = sequence_days(lines, selected_jobs, assignments, master)
-
-    selected_map = {j.job_id: j for j in selected_jobs}
-    unscheduled_idx: List[int] = []
-    for jid in unsched_ids:
-        if jid in selected_map:
-            unscheduled_idx.extend(selected_map[jid].line_indices)
-    for j in outside_jobs:
-        unscheduled_idx.extend(j.line_indices)
-    unscheduled_idx.extend(oversized_idxs)
-    unscheduled_idx = list(dict.fromkeys(unscheduled_idx))
-    unscheduled = lines.loc[unscheduled_idx].copy() if unscheduled_idx else lines.iloc[0:0].copy()
-
-    metrics = planning_metrics(days, cfg)
-    warnings, confidence = critic_report(days, unscheduled, quality, cfg)
-
-    planned_ids = {lid for d in days.values() for lid in d.get("_line_id", pd.Series(dtype=str)).tolist()}
-    duplicate_count = sum(1 for lid in planned_ids if sum((d.get("_line_id", pd.Series(dtype=str)) == lid).sum() for d in days.values()) > 1)
-    if duplicate_count:
-        warnings.append(f"ERREUR: {duplicate_count} doublon(s) de ligne détecté(s).")
-        confidence = min(confidence, 40)
-
-    steps = [
-        ("Agent Données", "OK", f"{len(source):,} lignes lues; {quality['eligible_lines']:,} lignes éligibles."),
-        ("Agent Référentiel", "OK", f"{master.history_rows:,} lignes historiques apprises; poudre={master.powder_coeff:.3f}; {master.minutes_per_bal:.1f} min/bal."),
-        ("Agent Quantités", "OK", "Lancement, PoidsT, Poudre, Nbre Bal et tps recalculés ligne par ligne."),
-        ("Agent Priorités", "OK", "Délais confirmés/demandés, ancienneté, statut OF et disponibilité matière scorés."),
-        ("Agent Planificateur", "OK", f"{engine}; {sum(len(x) for x in days.values())} lignes affectées."),
-        ("Agent Couleurs", "OK", f"{metrics['color_changes']} changement(s) couleur sur la semaine."),
-        ("Agent Critique", "OK" if not warnings else "ATTENTION", f"Confiance {confidence}% — {len(warnings)} avertissement(s)."),
-    ]
-
-    return {
-        "config": cfg,
-        "master": master,
-        "quality": quality,
-        "days": days,
-        "unscheduled": unscheduled,
-        "metrics": metrics,
-        "warnings": warnings,
-        "confidence": confidence,
-        "engine": engine,
-        "steps": steps,
-    }
-
-
-# -----------------------------------------------------------------------------
-# Agent 9 — Export Excel format métier exact
-# -----------------------------------------------------------------------------
+# =============================================================================
+# 10) AGENT CRITIQUE / VALIDATION
+# =============================================================================
 def business_day_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=OUTPUT_COLUMNS)
@@ -989,17 +1053,324 @@ def business_day_df(df: pd.DataFrame) -> pd.DataFrame:
     return out[OUTPUT_COLUMNS].reset_index(drop=True)
 
 
-def export_planning_excel(result: Dict[str, Any], include_summary: bool = True) -> bytes:
+def planning_metrics(days: Dict[int, pd.DataFrame], cfg: PlannerConfig, unscheduled: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    day_metrics = []
+    total_load = 0.0
+    total_cleaning = 0.0
+    late_planned = 0
+    late_days_sum = 0
+    two_color_days = 0
+    week_dates = iso_week_dates(cfg.year, cfg.week)
+
+    for d in range(6):
+        df = days[d]
+        production = float(pd.to_numeric(df.get("tps", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+        colors = list(dict.fromkeys(df.get("Couleur", pd.Series(dtype=str)).dropna().astype(str).str.upper().tolist()))
+        cleaning_h = cfg.cleaning_min / 60.0 if len(colors) == 2 else 0.0
+        if len(colors) == 2:
+            two_color_days += 1
+        total = production + cleaning_h
+        cap = day_capacity_h(cfg, d)
+        total_load += total
+        total_cleaning += cleaning_h
+
+        if not df.empty:
+            due = pd.to_datetime(df.get("_due"), errors="coerce")
+            for dt in due.dropna():
+                l = max(0, (week_dates[d] - dt.date()).days)
+                if l > 0:
+                    late_planned += 1
+                    late_days_sum += l
+
+        day_metrics.append({
+            "Jour": DAYS[d],
+            "Date": week_dates[d].strftime("%d/%m/%Y"),
+            "Charge production h": round(production, 2),
+            "Nettoyage h": round(cleaning_h, 2),
+            "Charge totale h": round(total, 2),
+            "Capacité h": round(cap, 2),
+            "Charge %": round(total / cap * 100, 1) if cap > 0 else 0.0,
+            "Couleurs": " → ".join(colors),
+            "Nb couleurs": len(colors),
+            "Lignes": int(len(df)),
+        })
+
+    total_capacity = sum(day_capacity_h(cfg, d) for d in range(6))
+    overdue_uns = 0
+    if unscheduled is not None and not unscheduled.empty and "_overdue_days" in unscheduled.columns:
+        overdue_uns = int((pd.to_numeric(unscheduled["_overdue_days"], errors="coerce").fillna(0) > 0).sum())
+
+    return {
+        "days": day_metrics,
+        "total_load_h": round(total_load, 2),
+        "capacity_h": round(total_capacity, 2),
+        "utilization_pct": round(total_load / total_capacity * 100, 1) if total_capacity else 0.0,
+        "cleaning_h": round(total_cleaning, 2),
+        "two_color_days": two_color_days,
+        "mono_color_days": sum(1 for x in day_metrics if x["Nb couleurs"] == 1),
+        "late_planned_lines": late_planned,
+        "late_days_sum": late_days_sum,
+        "overdue_unscheduled": overdue_uns,
+    }
+
+
+def validate_plan(days: Dict[int, pd.DataFrame], lines: pd.DataFrame, cfg: PlannerConfig) -> Tuple[List[str], List[str], int]:
+    hard: List[str] = []
+    soft: List[str] = []
+    metrics = planning_metrics(days, cfg)
+
+    # Contrôles durs.
+    for dm in metrics["days"]:
+        if dm["Capacité h"] <= 0 and dm["Lignes"] > 0:
+            hard.append(f"{dm['Jour']}: journée désactivée utilisée.")
+        if dm["Charge totale h"] > dm["Capacité h"] + 1e-6:
+            hard.append(f"{dm['Jour']}: surcharge {dm['Charge totale h']:.2f}h > {dm['Capacité h']:.2f}h.")
+        if dm["Nb couleurs"] > HARD_MAX_COLORS_PER_DAY:
+            hard.append(f"{dm['Jour']}: {dm['Nb couleurs']} couleurs > maximum 2.")
+        if dm["Nb couleurs"] == 2:
+            soft.append(f"{dm['Jour']}: 2 couleurs utilisées; 1 couleur reste la cible préférée.")
+
+    planned_frames = [d for d in days.values() if d is not None and not d.empty]
+    planned = pd.concat(planned_frames, ignore_index=True) if planned_frames else pd.DataFrame()
+    if not planned.empty:
+        if planned["_line_id"].duplicated().any():
+            hard.append("Doublon de ligne détecté dans le planning.")
+        source_ids = set(lines["_line_id"].astype(str))
+        if not set(planned["_line_id"].astype(str)).issubset(source_ids):
+            hard.append("Une ligne planifiée ne provient pas du pool éligible.")
+        for c in ["Lancement", "Nbre Bal", "tps"]:
+            vals = pd.to_numeric(planned[c], errors="coerce")
+            if vals.isna().any() or (vals < 0).any():
+                hard.append(f"Valeurs invalides dans {c}.")
+        if any(list(business_day_df(days[d]).columns) != OUTPUT_COLUMNS for d in range(6)):
+            hard.append("Format métier des 28 colonnes non conforme.")
+
+    # Score = couverture stricte des règles, pas une probabilité de réussite terrain.
+    confidence = 100 if not hard else max(0, 100 - min(100, len(hard) * 25))
+    return hard, soft, confidence
+
+
+def data_quality_notes(lines: pd.DataFrame, quality: Dict[str, Any]) -> List[str]:
+    notes: List[str] = []
+    q = quality.get("quality", {})
+    if q.get("poids_inconnu", 0):
+        notes.append(f"{q['poids_inconnu']} ligne(s) sans PoidsUn fiable: PoidsT/Poudre à contrôler.")
+    if q.get("poids_infere_source", 0):
+        notes.append(f"{q['poids_infere_source']} PoidsUn inféré(s) depuis d'autres lignes du même fichier source.")
+    if q.get("barres_estimees", 0):
+        notes.append(f"{q['barres_estimees']} Barre/bal estimé(s) par référentiel atelier / poids.")
+    if q.get("nuance_inconnue", 0):
+        notes.append(f"{q['nuance_inconnue']} nuance(s) non référencée(s): ordre couleur déterministe utilisé.")
+    return notes
+
+
+# =============================================================================
+# 11) AGENT SCÉNARIOS — orchestration complète
+# =============================================================================
+def _assemble(lines: pd.DataFrame, quality: Dict[str, Any], selected_jobs: List[Job], outside_jobs: List[Job], oversized: List[int], cfg: PlannerConfig) -> Dict[str, Any]:
+    assignments, unsched_ids, engine = assign_jobs(selected_jobs, cfg)
+    assignments, unsched_ids, repair_log = repair_assignments(selected_jobs, assignments, unsched_ids, cfg)
+    days = sequence_days(lines, selected_jobs, assignments)
+
+    job_map = {j.job_id: j for j in selected_jobs}
+    unscheduled_idx: List[int] = []
+    for jid in unsched_ids:
+        if jid in job_map:
+            unscheduled_idx.extend(job_map[jid].line_indices)
+    for job in outside_jobs:
+        unscheduled_idx.extend(job.line_indices)
+    unscheduled_idx.extend(oversized)
+    unscheduled_idx = list(dict.fromkeys(unscheduled_idx))
+    unscheduled = lines.loc[unscheduled_idx].copy() if unscheduled_idx else lines.iloc[0:0].copy()
+
+    metrics = planning_metrics(days, cfg, unscheduled)
+    hard, soft, confidence = validate_plan(days, lines, cfg)
+    notes = data_quality_notes(lines, quality)
+
+    weighted_backlog = float(pd.to_numeric(unscheduled.get("_score", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not unscheduled.empty else 0.0
+    scenario_score = (
+        metrics["overdue_unscheduled"] * 1_000_000
+        + metrics["late_days_sum"] * 80_000
+        + metrics["two_color_days"] * 35_000
+        + len(unscheduled) * 1_000
+        + weighted_backlog * 0.2
+        - metrics["utilization_pct"] * 250
+    )
+
+    return {
+        "config": cfg,
+        "days": days,
+        "unscheduled": unscheduled,
+        "metrics": metrics,
+        "hard_errors": hard,
+        "soft_warnings": soft,
+        "data_notes": notes,
+        "confidence": confidence,
+        "engine": engine,
+        "repair_log": repair_log,
+        "scenario_score": scenario_score,
+        "quality": quality,
+    }
+
+
+def generate_agentic_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str, Any]:
+    t_start = time.perf_counter()
+    master = learn_source_master(source, cfg.powder_coeff, cfg.minutes_per_bal)
+    lines, quality = build_candidate_lines(source, master, cfg)
+    if lines.empty:
+        raise ValueError("Aucune ligne éligible à planifier dans la source.")
+
+    jobs, oversized = build_jobs(lines, cfg)
+    selected_jobs, outside_jobs = select_candidate_pool(jobs, cfg)
+    strategies = ["Délais clients", "Mono-couleur", "Équilibre"] if cfg.strategy == "Auto — meilleur compromis" else [cfg.strategy]
+    per_seconds = max(3.0, cfg.solver_seconds / max(1, len(strategies)))
+
+    results = []
+    for strategy in strategies:
+        scfg = dc_replace(cfg, strategy=strategy, solver_seconds=per_seconds)
+        t0 = time.perf_counter()
+        r = _assemble(lines, quality, selected_jobs, outside_jobs, oversized, scfg)
+        r["elapsed_s"] = round(time.perf_counter() - t0, 2)
+        results.append(r)
+
+    # Priorité absolue à la validité puis à la politique atelier mono-couleur.
+    # Les retards départagent ensuite les propositions de même qualité couleur.
+    best = min(results, key=lambda r: (
+        len(r["hard_errors"]),
+        r["metrics"]["two_color_days"],
+        r["metrics"]["overdue_unscheduled"],
+        r["metrics"]["late_days_sum"],
+        r["scenario_score"],
+    ))
+
+    selected_strategy = best["config"].strategy
+    scenario_table = pd.DataFrame([
+        {
+            "Scénario": r["config"].strategy,
+            "Moteur": r["engine"],
+            "Confiance règles %": r["confidence"],
+            "Charge h": r["metrics"]["total_load_h"],
+            "Utilisation %": r["metrics"]["utilization_pct"],
+            "Jours mono-couleur": r["metrics"]["mono_color_days"],
+            "Jours 2 couleurs": r["metrics"]["two_color_days"],
+            "Retards backlog": r["metrics"]["overdue_unscheduled"],
+            "Retard planifié (jours)": r["metrics"]["late_days_sum"],
+            "Backlog": len(r["unscheduled"]),
+            "Temps s": r["elapsed_s"],
+        }
+        for r in results
+    ])
+    best["selected_strategy"] = selected_strategy
+    best["scenario_table"] = scenario_table
+    best["config"] = cfg
+    best["master"] = master
+    best["lines"] = lines
+    best["total_elapsed_s"] = round(time.perf_counter() - t_start, 2)
+
+    best["steps"] = [
+        ("Agent Données", "OK", f"{len(source):,} lignes lues depuis GitHub; {len(lines):,} lignes éligibles."),
+        ("Agent Référentiel", "OK", f"{master.source_weight_samples:,} poids source appris; cadence {master.minutes_per_bal:.1f} min/bal; poudre {master.powder_coeff:.3f}."),
+        ("Agent Quantités", "OK", "Lancement, poids, poudre, balancelles et temps recalculés automatiquement."),
+        ("Agent Priorités", "OK", "Délais, retards, ancienneté, OF et disponibilité matière scorés."),
+        ("Agent Scénarios", "OK", f"{len(results)} scénario(s) comparé(s); {best['selected_strategy']} retenu."),
+        ("Agent Planificateur", "OK", f"{best['engine']} · contrainte dure: maximum 2 couleurs/jour."),
+        ("Agent Couleurs", "OK", f"{best['metrics']['mono_color_days']} jour(s) mono-couleur; {best['metrics']['two_color_days']} jour(s) à 2 couleurs."),
+        ("Agent Réparation", "OK", f"{len(best['repair_log'])} correction(s) autonome(s)."),
+        ("Agent Validation", "OK" if best["confidence"] == 100 else "ERREUR", f"Confiance règles {best['confidence']}% · {len(best['hard_errors'])} erreur(s) dure(s)."),
+    ]
+    return best
+
+
+# =============================================================================
+# 12) EXPLICATIONS
+# =============================================================================
+def explanation_table(result: Dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    week_dates = iso_week_dates(result["config"].year, result["config"].week)
+    for d in range(6):
+        df = result["days"][d]
+        if df.empty:
+            continue
+        for _, r in df.iterrows():
+            due = parse_date(r.get("_due"))
+            rows.append({
+                "Jour": DAYS[d].title(),
+                "Date": week_dates[d].strftime("%d/%m/%Y"),
+                "Commande": r["NumCommande"],
+                "Client": r["NomClient"],
+                "Couleur": r["Couleur"],
+                "Article": r["Article/int"],
+                "Échéance": due.strftime("%d/%m/%Y") if due is not None else "—",
+                "Score IA": round(to_float(r.get("_score")), 1),
+                "Raison": norm_text(r.get("_reason")),
+            })
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 13) EXPORT EXCEL
+# =============================================================================
+def export_planning_excel(result: Dict[str, Any]) -> bytes:
     cfg: PlannerConfig = result["config"]
     out = io.BytesIO()
     wb = Workbook()
     wb.remove(wb.active)
 
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    color_change_fill = PatternFill("solid", fgColor="DDEBF7")
-    thin_gray = Side(style="thin", color="D9E2F3")
-    warning_fill = PatternFill("solid", fgColor="FFF2CC")
+    navy = "163A5F"
+    blue = "155EEF"
+    light = "EEF4FF"
+    green = "ECFDF3"
+    amber = "FFFAEB"
+    red = "FEF3F2"
+    white = "FFFFFF"
+    line = Side(style="thin", color="D0D5DD")
+
+    # Résumé IA
+    ws = wb.create_sheet("Résumé IA")
+    ws["A1"] = "ALLUCO — Planning Laquage Agentic IA"
+    ws["A1"].font = Font(size=16, bold=True, color=white)
+    ws["A1"].fill = PatternFill("solid", fgColor=navy)
+    ws.merge_cells("A1:F1")
+    summary = [
+        ("Semaine", f"S{cfg.week} / {cfg.year}"),
+        ("Scénario retenu", result.get("selected_strategy", cfg.strategy)),
+        ("Moteur", result["engine"]),
+        ("Confiance règles", f"{result['confidence']}%"),
+        ("Politique couleur", "1 couleur/jour privilégiée · 2 maximum"),
+        ("Charge semaine", f"{result['metrics']['total_load_h']:.2f} h"),
+        ("Capacité", f"{result['metrics']['capacity_h']:.2f} h"),
+        ("Utilisation", f"{result['metrics']['utilization_pct']:.1f}%"),
+        ("Jours mono-couleur", result['metrics']['mono_color_days']),
+        ("Jours à 2 couleurs", result['metrics']['two_color_days']),
+        ("Backlog", len(result["unscheduled"])),
+        ("Retards backlog", result['metrics']['overdue_unscheduled']),
+    ]
+    for i, (k, v) in enumerate(summary, start=3):
+        ws.cell(i, 1, k).font = Font(bold=True, color=navy)
+        ws.cell(i, 2, v)
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 34
+
+    # Contrôles
+    row = 17
+    ws.cell(row, 1, "Contrôles").font = Font(bold=True, color=navy, size=12)
+    row += 1
+    if result["hard_errors"]:
+        for msg in result["hard_errors"]:
+            ws.cell(row, 1, "ERREUR")
+            ws.cell(row, 2, msg)
+            ws.cell(row, 1).fill = PatternFill("solid", fgColor=red)
+            row += 1
+    else:
+        ws.cell(row, 1, "OK")
+        ws.cell(row, 2, "Toutes les règles du moteur sont validées.")
+        ws.cell(row, 1).fill = PatternFill("solid", fgColor=green)
+        row += 1
+    for msg in result["soft_warnings"] + result["data_notes"]:
+        ws.cell(row, 1, "INFO")
+        ws.cell(row, 2, msg)
+        ws.cell(row, 1).fill = PatternFill("solid", fgColor=amber)
+        row += 1
 
     numeric_int_cols = {"QteCommandé", "ResteALivrer", "Prelevé", "QteCommencé", "QteRestante", "QteRèçu", "ReserverBR", "StockPhysique", "Reserver", "Lancement", "Re-laquage", "Barre/bal", "Nbre Bal", "Stock brut"}
     numeric_dec_cols = {"Nuance", "PoidsUn", "PoidsT", "Poudre", "tps"}
@@ -1009,241 +1380,196 @@ def export_planning_excel(result: Dict[str, Any], include_summary: bool = True) 
         df = business_day_df(result["days"][d])
         for ci, col in enumerate(OUTPUT_COLUMNS, 1):
             cell = ws.cell(1, ci, col)
-            cell.fill = header_fill
-            cell.font = header_font
+            cell.fill = PatternFill("solid", fgColor=navy)
+            cell.font = Font(color=white, bold=True)
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        prev_color = None
-        for ri, row in enumerate(df.itertuples(index=False, name=None), 2):
-            current_color = norm_text(row[OUTPUT_COLUMNS.index("Couleur")])
-            for ci, value in enumerate(row, 1):
-                cell = ws.cell(ri, ci, value)
-                cell.alignment = Alignment(vertical="center")
-                colname = OUTPUT_COLUMNS[ci - 1]
-                if colname == "DateCréation" and isinstance(value, (datetime, pd.Timestamp)):
-                    cell.number_format = "dd/mm/yyyy hh:mm"
-                elif colname in numeric_int_cols and isinstance(value, (int, float, np.integer, np.floating)) and not pd.isna(value):
+            cell.border = Border(bottom=line)
+        previous_color = None
+        for ri, (_, r) in enumerate(df.iterrows(), start=2):
+            current_color = norm_text(r.get("Couleur"))
+            change = previous_color is not None and current_color != previous_color
+            for ci, col in enumerate(OUTPUT_COLUMNS, 1):
+                v = r.get(col)
+                if isinstance(v, pd.Timestamp):
+                    v = v.to_pydatetime()
+                cell = ws.cell(ri, ci, v)
+                cell.border = Border(bottom=Side(style="hair", color="EAECF0"))
+                if change:
+                    cell.fill = PatternFill("solid", fgColor=light)
+                if col in numeric_int_cols and v is not None:
                     cell.number_format = "0"
-                elif colname in numeric_dec_cols and isinstance(value, (int, float, np.integer, np.floating)) and not pd.isna(value):
+                elif col in numeric_dec_cols and v is not None:
                     cell.number_format = "0.000"
-            if prev_color is not None and current_color != prev_color:
-                for ci in range(1, len(OUTPUT_COLUMNS) + 1):
-                    ws.cell(ri, ci).border = Border(top=Side(style="medium", color="5B9BD5"))
-            prev_color = current_color
-
+                elif col == "DateCréation" and isinstance(v, datetime):
+                    cell.number_format = "dd/mm/yyyy"
+            previous_color = current_color
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = f"A1:{get_column_letter(len(OUTPUT_COLUMNS))}{max(1, len(df)+1)}"
-        ws.sheet_view.showGridLines = False
-        ws.row_dimensions[1].height = 30
-        widths = {
-            "NumCommande": 15, "DateCréation": 19, "NomClient": 34, "Article": 24, "Article/int": 20,
-            "Couleur": 14, "Nuance": 10, "QteCommandé": 13, "ResteALivrer": 13, "Prelevé": 10,
-            "reservation brut": 15, "NumOF": 15, "ProdStatut": 15, "QteCommencé": 13, "QteRestante": 13,
-            "QteRèçu": 11, "ReserverBR": 12, "StockPhysique": 13, "Reserver": 10, "Lancement": 12,
-            "Re-laquage": 12, "PoidsUn": 11, "PoidsT": 12, "Poudre": 11, "Barre/bal": 11,
-            "Nbre Bal": 10, "tps": 9, "Stock brut": 12,
-        }
-        for ci, col in enumerate(OUTPUT_COLUMNS, 1):
-            ws.column_dimensions[get_column_letter(ci)].width = widths.get(col, 13)
+        widths = {1: 16, 2: 13, 3: 23, 4: 25, 5: 18, 6: 12, 7: 10, 12: 14, 13: 16}
+        for ci in range(1, len(OUTPUT_COLUMNS) + 1):
+            ws.column_dimensions[get_column_letter(ci)].width = widths.get(ci, 13)
 
-        # mini-résumé à droite du tableau, sans modifier les 28 colonnes métier
-        start = len(OUTPUT_COLUMNS) + 2
-        dm = result["metrics"]["days"][d]
-        ws.cell(1, start, "Résumé IA").fill = header_fill
-        ws.cell(1, start).font = header_font
-        summary = [
-            ("Charge production h", dm["Charge production h"]),
-            ("Nettoyage h", dm["Nettoyage h"]),
-            ("Charge totale h", dm["Charge totale h"]),
-            ("Capacité h", dm["Capacité h"]),
-            ("Charge %", dm["Charge %"] / 100.0),
-            ("Couleurs", dm["Couleurs"]),
-            ("Lignes", dm["Lignes"]),
-        ]
-        for i, (k, v) in enumerate(summary, 2):
-            ws.cell(i, start, k).font = Font(bold=True)
-            ws.cell(i, start + 1, v)
-        ws.cell(6, start + 1).number_format = "0.0%"
-        ws.column_dimensions[get_column_letter(start)].width = 22
-        ws.column_dimensions[get_column_letter(start + 1)].width = 28
+    # Backlog
+    ws = wb.create_sheet("Backlog")
+    backlog_cols = ["NumCommande", "NomClient", "Article", "Couleur", "ResteALivrer", "NumOF", "ProdStatut", "tps", "_overdue_days", "_score", "_reason"]
+    backlog = result["unscheduled"].copy()
+    cols = [c for c in backlog_cols if c in backlog.columns]
+    for ci, c in enumerate(cols, 1):
+        ws.cell(1, ci, c).fill = PatternFill("solid", fgColor=navy)
+        ws.cell(1, ci).font = Font(color=white, bold=True)
+    if not backlog.empty:
+        backlog = backlog.sort_values("_score", ascending=False)
+        for ri, (_, r) in enumerate(backlog[cols].iterrows(), start=2):
+            for ci, c in enumerate(cols, 1):
+                ws.cell(ri, ci, r.get(c))
+    ws.freeze_panes = "A2"
 
-    if include_summary:
-        ws = wb.create_sheet("Résumé IA")
-        ws.sheet_view.showGridLines = False
-        ws["A1"] = APP_NAME
-        ws["A1"].font = Font(size=18, bold=True, color="1F4E78")
-        cfg = result["config"]
-        ws["A3"] = "Semaine"
-        ws["B3"] = f"S{cfg.week} - {cfg.year}"
-        ws["A4"] = "Moteur"
-        ws["B4"] = result["engine"]
-        ws["A5"] = "Confiance"
-        ws["B5"] = result["confidence"] / 100.0
-        ws["B5"].number_format = "0%"
-        ws["A6"] = "Utilisation semaine"
-        ws["B6"] = result["metrics"]["utilization_pct"] / 100.0
-        ws["B6"].number_format = "0.0%"
-        ws["A7"] = "Changements couleur"
-        ws["B7"] = result["metrics"]["color_changes"]
-        ws["A9"] = "Agent"
-        ws["B9"] = "Statut"
-        ws["C9"] = "Explication"
-        for c in ws[9]:
-            c.fill = header_fill
-            c.font = header_font
-        for r, (agent, status, msg) in enumerate(result["steps"], 10):
-            ws.cell(r, 1, agent)
-            ws.cell(r, 2, status)
-            ws.cell(r, 3, msg)
-            if status != "OK":
-                ws.cell(r, 2).fill = warning_fill
-        start = 10 + len(result["steps"]) + 2
-        ws.cell(start, 1, "Avertissements").font = Font(bold=True, color="C65911")
-        for i, msg in enumerate(result["warnings"] or ["Aucun avertissement bloquant."], start + 1):
-            ws.cell(i, 1, "• " + msg)
-        ws.column_dimensions["A"].width = 28
-        ws.column_dimensions["B"].width = 18
-        ws.column_dimensions["C"].width = 110
+    # Explications IA
+    expl = explanation_table(result)
+    ws = wb.create_sheet("Décisions IA")
+    if not expl.empty:
+        for ci, c in enumerate(expl.columns, 1):
+            ws.cell(1, ci, c).fill = PatternFill("solid", fgColor=blue)
+            ws.cell(1, ci).font = Font(color=white, bold=True)
+        for ri, (_, r) in enumerate(expl.iterrows(), start=2):
+            for ci, c in enumerate(expl.columns, 1):
+                ws.cell(ri, ci, r.get(c))
+        ws.freeze_panes = "A2"
+        for ci in range(1, len(expl.columns) + 1):
+            ws.column_dimensions[get_column_letter(ci)].width = 18 if ci != len(expl.columns) else 50
 
     wb.save(out)
     return out.getvalue()
 
 
-# -----------------------------------------------------------------------------
-# Streamlit UI — claire, chemin utilisateur très court
-# -----------------------------------------------------------------------------
-CSS = """
+# =============================================================================
+# 14) UI / DESIGN
+# =============================================================================
+CSS = r"""
 <style>
-html, body, .stApp, [data-testid="stAppViewContainer"] { background:#F6F8FC; color:#182230; color-scheme:light; }
-header[data-testid="stHeader"] { background:rgba(246,248,252,.96); }
-/* Ne jamais masquer stToolbar / le contrôle sidebar : sinon on ne peut plus rouvrir la navigation. */
-.block-container { max-width:1500px; padding-top:1.25rem; padding-bottom:3rem; }
-section[data-testid="stSidebar"] { background:#FFFFFF; border-right:1px solid #E7ECF3; }
-.card { background:#FFF; border:1px solid #E2E8F0; border-radius:16px; padding:1rem 1.15rem; box-shadow:0 1px 2px rgba(16,24,40,.03); }
-.hero { background:#FFF; border:1px solid #DDE5F0; border-radius:18px; padding:1.25rem 1.4rem; margin-bottom:1rem; }
-.hero h1 { margin:0; font-size:1.55rem; }
-.muted { color:#667085; font-size:.9rem; }
-.agent-ok { border-left:4px solid #12B76A; padding:.55rem .8rem; background:#F6FEF9; border-radius:8px; margin:.35rem 0; }
-.agent-warn { border-left:4px solid #F79009; padding:.55rem .8rem; background:#FFFAEB; border-radius:8px; margin:.35rem 0; }
-[data-testid="stMetric"] { background:#FFF; border:1px solid #E2E8F0; border-radius:14px; padding:.7rem .9rem; }
-.stButton>button[kind="primary"] { border-radius:10px; font-weight:700; }
+:root{--bg:#F5F7FB;--card:#FFFFFF;--ink:#172033;--muted:#667085;--line:#E4E9F0;--blue:#155EEF;--navy:#14365A;--green:#067647;--amber:#B54708;--red:#B42318}
+html,body,.stApp,[data-testid="stAppViewContainer"]{background:var(--bg)!important;color:var(--ink)!important;color-scheme:light!important}
+header[data-testid="stHeader"]{background:rgba(245,247,251,.94)!important;box-shadow:none!important}
+#MainMenu,footer,[data-testid="stAppDeployButton"],[data-testid="stHeaderActionElements"],[data-testid="stMainMenu"],[data-testid="stStatusWidget"]{display:none!important;visibility:hidden!important}
+/* Masque les actions Share/Edit/GitHub sans supprimer le contrôle natif de sidebar. */
+header button[title="Share"],header button[aria-label="Share"],header a[aria-label*="GitHub"],header button[aria-label*="GitHub"],header button[title="Edit"]{display:none!important}
+.block-container{max-width:1520px;padding-top:1rem;padding-bottom:2rem}
+section[data-testid="stSidebar"],section[data-testid="stSidebar"]>div{background:#FFF!important;border-right:1px solid var(--line)}
+h1,h2,h3,h4,h5,h6,p,label,span,div{color:var(--ink)}
+[data-testid="stCaptionContainer"],.stCaption{color:var(--muted)!important}
+.brand{display:flex;align-items:center;gap:.75rem;margin:.2rem 0 1rem}.brandmark{width:44px;height:44px;border-radius:13px;background:linear-gradient(145deg,#123B67,#155EEF);color:#fff!important;display:flex;align-items:center;justify-content:center;font-weight:950;font-size:1.4rem;box-shadow:0 8px 20px rgba(21,94,239,.2)}.brandname{font-weight:950;font-size:1.05rem;letter-spacing:.06em}.brandsub{font-size:.72rem;color:var(--muted)!important}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin:.2rem 0 1rem}.title{font-size:1.55rem;font-weight:950;letter-spacing:-.025em}.subtitle{font-size:.86rem;color:var(--muted)!important;margin-top:.15rem}.weekbadge{background:#EEF4FF;color:#155EEF!important;border:1px solid #C7D7FE;padding:.42rem .72rem;border-radius:999px;font-weight:850;font-size:.78rem}
+.hero{background:linear-gradient(135deg,#123B67 0%,#155EEF 100%);border-radius:20px;padding:1.3rem 1.45rem;margin-bottom:1rem;box-shadow:0 12px 30px rgba(21,94,239,.12)}.hero *{color:#fff!important}.hero-title{font-weight:950;font-size:1.28rem}.hero-sub{opacity:.9;font-size:.89rem;margin-top:.35rem;max-width:1050px}
+.card{background:#FFF;border:1px solid var(--line);border-radius:16px;padding:1rem 1.1rem;box-shadow:0 1px 3px rgba(16,24,40,.035)}
+.kpi{background:#FFF;border:1px solid var(--line);border-radius:15px;padding:.86rem 1rem;min-height:98px}.kpi-l{font-size:.70rem;font-weight:850;color:var(--muted)!important;text-transform:uppercase;letter-spacing:.05em}.kpi-v{font-size:1.42rem;font-weight:950;margin-top:.25rem}.kpi-s{font-size:.72rem;color:var(--muted)!important;margin-top:.15rem}
+.status-ok{display:inline-flex;align-items:center;gap:.35rem;color:#067647!important;background:#ECFDF3;border:1px solid #ABEFC6;padding:.34rem .58rem;border-radius:999px;font-size:.75rem;font-weight:850}.status-warn{display:inline-flex;align-items:center;gap:.35rem;color:#B54708!important;background:#FFFAEB;border:1px solid #FEDF89;padding:.34rem .58rem;border-radius:999px;font-size:.75rem;font-weight:850}.status-err{display:inline-flex;align-items:center;gap:.35rem;color:#B42318!important;background:#FEF3F2;border:1px solid #FECDCA;padding:.34rem .58rem;border-radius:999px;font-size:.75rem;font-weight:850}
+.agent{background:#FFF;border:1px solid var(--line);border-radius:12px;padding:.68rem .8rem;margin:.35rem 0}.agent-ok{border-left:4px solid #12B76A}.agent-warn{border-left:4px solid #F79009}.agent b{font-size:.83rem}.agent small{color:var(--muted)!important}
+[data-testid="stMetric"]{background:#FFF;border:1px solid var(--line);border-radius:14px;padding:.72rem .9rem}.stButton>button{border-radius:10px;font-weight:800;border:1px solid #D5DCE6;min-height:42px}.stButton>button[kind="primary"]{background:#155EEF;border-color:#155EEF;color:#fff!important}.stButton>button[kind="primary"] *{color:#fff!important}
+[data-testid="stDataFrame"],[data-testid="stDataEditor"]{background:#FFF;border:1px solid var(--line);border-radius:14px;overflow:hidden}button[data-baseweb="tab"]{font-weight:800}button[data-baseweb="tab"][aria-selected="true"]{color:#155EEF!important}.stDownloadButton button{border-radius:10px;font-weight:850}
+@media(max-width:900px){.block-container{padding-left:.75rem;padding-right:.75rem}.topbar{align-items:flex-start;flex-direction:column;gap:.55rem}.hero{padding:1rem}}
 </style>
 """
 
 
-def render_ui() -> None:
-    if st is None:
-        raise RuntimeError("Streamlit n'est pas installé. Lancez: pip install -r requirements.txt")
-    st.set_page_config(page_title=APP_NAME, page_icon="🤖", layout="wide", initial_sidebar_state="expanded")
-    st.markdown(CSS, unsafe_allow_html=True)
+def _brand() -> None:
+    st.markdown("<div class='brand'><div class='brandmark'>A</div><div><div class='brandname'>ALLUCO</div><div class='brandsub'>Planning Laquage Agentic IA</div></div></div>", unsafe_allow_html=True)
 
-    today = date.today().isocalendar()
-    with st.sidebar:
-        st.markdown("## ALLUCO")
-        st.caption("Planning IA agentique")
-        st.divider()
-        year = st.number_input("Année", 2024, 2035, int(today.year), 1)
-        week = st.number_input("Semaine", 1, 53, int(today.week), 1)
-        strategy = st.selectbox("Objectif IA", ["Équilibre", "Délais clients", "Rendement couleurs"])
-        capacity = st.number_input("Capacité / jour (h)", 1.0, 24.0, 15.0, 0.5)
-        max_colors = st.slider("Max couleurs / jour", 1, 6, 3)
-        cleaning = st.number_input("Nettoyage / changement (min)", 0, 120, 0, 5)
-        with st.expander("Réglages avancés"):
-            hist_batch = st.checkbox("Apprendre les lots de lancement historiques", value=False,
-                                     help="Peut produire légèrement plus que le reste à livrer pour reproduire une politique de lot historique.")
-            overprod = st.slider("Surproduction max (%)", 0, 100, 20, 5, disabled=not hist_batch)
-            relaquage = st.checkbox("Autoriser re-laquage depuis stock", value=False)
-            solver_sec = st.slider("Temps solveur OR-Tools (s)", 2, 60, 12, 2)
 
-    st.markdown("<div class='hero'><h1>🤖 Planning IA Agentique</h1><div class='muted'>Déposez la base commandes. L'IA prépare automatiquement la semaine, puis vous vérifiez et exportez le planning Excel métier.</div></div>", unsafe_allow_html=True)
+def _top(title: str, subtitle: str, cfg: PlannerConfig) -> None:
+    st.markdown(f"<div class='topbar'><div><div class='title'>{title}</div><div class='subtitle'>{subtitle}</div></div><div class='weekbadge'>S{cfg.week} · {cfg.year}</div></div>", unsafe_allow_html=True)
 
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        src_file = st.file_uploader("1. Base commandes client", type=["xlsx"], key="src", help="Format: Base Commandes Client encours confirmées par mois.xlsx")
-    with c2:
-        hist_file = st.file_uploader("2. Planning historique (optionnel mais recommandé)", type=["xlsx"], key="hist", help="Ex.: Planning S36.xlsx. Sert à apprendre PoidsUn, Barre/bal, Stock brut, nuances, poudre et cadence.")
 
-    if src_file is None:
-        st.info("Déposez le fichier commandes pour commencer.")
-        return
+def _kpi(label: str, value: str, sub: str = "") -> None:
+    st.markdown(f"<div class='kpi'><div class='kpi-l'>{label}</div><div class='kpi-v'>{value}</div><div class='kpi-s'>{sub}</div></div>", unsafe_allow_html=True)
 
-    try:
-        source = load_source_workbook(bytes_from_file(src_file))
-        history = load_historical_planning(bytes_from_file(hist_file)) if hist_file is not None else None
-        master = learn_master(history)
-    except Exception as e:
-        st.error(f"Lecture impossible: {e}")
-        return
 
-    q1, q2, q3, q4 = st.columns(4)
-    q1.metric("Lignes source", f"{len(source):,}".replace(",", " "))
-    q2.metric("Historique appris", f"{master.history_rows:,}".replace(",", " "))
-    q3.metric("Cadence", f"{master.minutes_per_bal:.1f} min/bal")
-    q4.metric("Coeff. poudre", f"{master.powder_coeff:.3f}")
+def _parse_commands(text: str) -> Tuple[str, ...]:
+    return tuple(dict.fromkeys(x.strip().upper() for x in re.split(r"[,;\n]+", text or "") if x.strip()))
 
-    cfg = PlannerConfig(
-        year=int(year), week=int(week), capacity_h=float(capacity), cleaning_min=int(cleaning),
-        max_colors_per_day=int(max_colors), strategy=strategy, use_historical_batches=hist_batch,
-        max_overproduction_pct=float(overprod), allow_relaquage=relaquage, solver_seconds=float(solver_sec),
-    )
 
-    if st.button("✨ Générer le meilleur planning IA", type="primary", use_container_width=True):
-        with st.spinner("Agents en action : données → priorités → optimisation → critique → export..."):
-            try:
-                st.session_state["plan_result"] = generate_agentic_plan(source, history, cfg)
-            except Exception as e:
-                st.exception(e)
-                return
+def _source_signature(path: Path, cfg: PlannerConfig) -> str:
+    payload = [str(path.resolve()), str(path.stat().st_mtime_ns), str(path.stat().st_size), json.dumps(cfg.__dict__, sort_keys=True, default=str)]
+    return hashlib.sha256("|".join(payload).encode("utf-8")).hexdigest()
 
-    result = st.session_state.get("plan_result")
-    if not result:
-        return
-    # invalider visuellement si l'utilisateur change semaine/config sans régénérer
-    old_cfg: PlannerConfig = result["config"]
-    if (old_cfg.year, old_cfg.week) != (cfg.year, cfg.week):
-        st.warning("La proposition affichée correspond à une autre semaine. Cliquez de nouveau sur Générer.")
 
-    st.markdown("### Résultat")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    planned_lines = sum(len(x) for x in result["days"].values())
-    m1.metric("Lignes planifiées", planned_lines)
-    m2.metric("Charge semaine", f"{result['metrics']['total_load_h']:.1f} h")
-    m3.metric("Utilisation", f"{result['metrics']['utilization_pct']:.0f} %")
-    m4.metric("Changements couleur", result["metrics"]["color_changes"])
-    m5.metric("Confiance", f"{result['confidence']} %")
+if st is not None:
+    @st.cache_data(show_spinner=False)
+    def _cached_source(path: str, mtime_ns: int, size: int) -> pd.DataFrame:
+        return load_source_workbook(Path(path).read_bytes())
 
-    st.caption(f"Moteur : {result['engine']} — OR-Tools {'actif' if ORTOOLS_AVAILABLE else 'non installé, fallback local utilisé'}")
 
-    with st.expander("🧠 Rapport des agents", expanded=True):
-        for agent, status, msg in result["steps"]:
-            cls = "agent-ok" if status == "OK" else "agent-warn"
-            st.markdown(f"<div class='{cls}'><b>{agent}</b> — {status}<br><span class='muted'>{msg}</span></div>", unsafe_allow_html=True)
-        for wmsg in result["warnings"]:
-            st.warning(wmsg)
+def render_planning(result: Dict[str, Any], cfg: PlannerConfig) -> None:
+    m = result["metrics"]
+    hero_msg = "Le moteur choisit automatiquement les commandes, privilégie une seule couleur par jour et n'autorise jamais plus de deux couleurs. Il compare plusieurs stratégies, répare la proposition puis la valide avant affichage."
+    st.markdown(f"<div class='hero'><div class='hero-title'>Proposition IA recommandée · {result['selected_strategy']}</div><div class='hero-sub'>{hero_msg}</div></div>", unsafe_allow_html=True)
 
-    tabs = st.tabs([d.capitalize() for d in DAYS])
+    cols = st.columns(6)
+    values = [
+        ("Confiance règles", f"{result['confidence']}%", "validation déterministe"),
+        ("Charge", f"{m['total_load_h']:.1f} h", f"sur {m['capacity_h']:.1f} h"),
+        ("Utilisation", f"{m['utilization_pct']:.0f}%", "semaine"),
+        ("Mono-couleur", str(m["mono_color_days"]), "jour(s)"),
+        ("2 couleurs", str(m["two_color_days"]), "maximum autorisé"),
+        ("Backlog", str(len(result["unscheduled"])), "ligne(s) hors semaine"),
+    ]
+    for col, (a, b, s) in zip(cols, values):
+        with col:
+            _kpi(a, b, s)
+
+    st.caption("Confiance 100% = toutes les règles codées sont validées. La qualité du résultat dépend aussi de la qualité des données du fichier source.")
+    st.write("")
+
+    left, right = st.columns([3, 2])
+    with left:
+        chart = pd.DataFrame({
+            "Jour": [x["Jour"].title() for x in m["days"]],
+            "Charge h": [x["Charge totale h"] for x in m["days"]],
+            "Capacité h": [x["Capacité h"] for x in m["days"]],
+        }).set_index("Jour")
+        st.markdown("#### Charge par jour")
+        st.bar_chart(chart)
+    with right:
+        st.markdown("#### Validation IA")
+        if result["confidence"] == 100:
+            st.markdown("<span class='status-ok'>● 100% des règles validées</span>", unsafe_allow_html=True)
+        else:
+            st.markdown("<span class='status-err'>● Contrôle bloquant détecté</span>", unsafe_allow_html=True)
+        st.write("")
+        st.caption(f"Moteur: {result['engine']}")
+        st.caption("Politique couleur: 1 couleur privilégiée · 2 maximum")
+        st.caption(f"Temps calcul: {result['total_elapsed_s']:.2f} s")
+        st.caption(f"Retards backlog: {m['overdue_unscheduled']}")
+
+    if result["hard_errors"]:
+        for msg in result["hard_errors"]:
+            st.error(msg)
+    if result["soft_warnings"]:
+        with st.expander("Informations planning"):
+            for msg in result["soft_warnings"]:
+                st.write("• " + msg)
+    if result["data_notes"]:
+        with st.expander("Qualité / estimations de données"):
+            for msg in result["data_notes"]:
+                st.write("• " + msg)
+
+    st.markdown("#### Planning détaillé")
+    tabs = st.tabs([f"{DAYS[d].title()} · {m['days'][d]['Date'][:5]}" for d in range(6)])
     for d, tab in enumerate(tabs):
         with tab:
-            dm = result["metrics"]["days"][d]
+            dm = m["days"][d]
             a, b, c, e = st.columns(4)
-            a.metric("Charge", f"{dm['Charge totale h']:.2f} h / {dm['Capacité h']:.1f} h")
-            b.metric("Charge %", f"{dm['Charge %']:.0f} %")
-            c.metric("Lignes", dm["Lignes"])
-            e.metric("Couleurs", dm["Nb couleurs"])
+            a.metric("Charge", f"{dm['Charge totale h']:.2f} h", f"cap. {dm['Capacité h']:.1f} h")
+            b.metric("Utilisation", f"{dm['Charge %']:.0f}%")
+            c.metric("Couleurs", dm["Nb couleurs"])
+            e.metric("Lignes", dm["Lignes"])
             if dm["Couleurs"]:
-                st.caption("Séquence : " + dm["Couleurs"])
-            st.dataframe(business_day_df(result["days"][d]), hide_index=True, use_container_width=True, height=500)
+                st.caption("Séquence: " + dm["Couleurs"])
+            st.dataframe(business_day_df(result["days"][d]), hide_index=True, use_container_width=True, height=490)
 
-    with st.expander(f"Backlog hors semaine — {len(result['unscheduled'])} ligne(s)"):
-        if result["unscheduled"].empty:
-            st.success("Tout le pool prioritaire tient dans la semaine.")
-        else:
-            cols = ["NumCommande", "NomClient", "Article", "Couleur", "ResteALivrer", "tps", "_overdue_days", "_score"]
-            show = result["unscheduled"][cols].sort_values("_score", ascending=False).head(500).rename(columns={"_overdue_days": "Retard jours", "_score": "Score IA"})
-            st.dataframe(show, hide_index=True, use_container_width=True)
-
-    excel = export_planning_excel(result, include_summary=True)
+    st.write("")
+    excel = export_planning_excel(result)
     st.download_button(
-        "⬇️ Télécharger le Planning IA Excel",
+        "⬇ Télécharger le planning Excel",
         data=excel,
         file_name=f"Planning_IA_S{cfg.week}_{cfg.year}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1252,71 +1578,224 @@ def render_ui() -> None:
     )
 
 
-# -----------------------------------------------------------------------------
-# Tests / CLI (utile même sans Streamlit et sans OR-Tools)
-# -----------------------------------------------------------------------------
-def cli_generate(source_path: str, history_path: Optional[str], output_path: str, year: int, week: int) -> Dict[str, Any]:
+def render_ui() -> None:
+    if st is None:
+        raise RuntimeError("Streamlit n'est pas installé. Lancez: pip install -r requirements.txt")
+
+    st.set_page_config(page_title=APP_NAME, page_icon="🤖", layout="wide", initial_sidebar_state="expanded")
+    st.markdown(CSS, unsafe_allow_html=True)
+
+    if not SOURCE_PATH.exists():
+        cfg = PlannerConfig(DEFAULT_YEAR, DEFAULT_WEEK)
+        _top("Fichier source absent", "Le planning ne peut pas être calculé.", cfg)
+        st.error(f"Ajoutez `{SOURCE_FILENAME}` à côté de `app.py` dans GitHub.")
+        return
+
+    today = date.today().isocalendar()
+    with st.sidebar:
+        _brand()
+        nav = st.radio("Navigation", ["🤖 Planning IA", "🏠 Tableau de bord", "🧠 Analyse IA", "⚙️ Paramètres"], label_visibility="collapsed")
+        st.divider()
+        year = int(st.number_input("Année", 2024, 2035, DEFAULT_YEAR or int(today.year), 1))
+        week = int(st.number_input("Semaine", 1, 53, DEFAULT_WEEK or int(today.week), 1))
+        objective = st.selectbox("Objectif", ["Auto — meilleur compromis", "Délais clients", "Mono-couleur", "Équilibre"])
+        with st.expander("Réglages production"):
+            cap = float(st.number_input("Capacité Lun–Ven (h)", 1.0, 24.0, DEFAULT_CAPACITY_H, 0.5))
+            sat = st.checkbox("Production samedi", value=DEFAULT_SATURDAY_ENABLED)
+            sat_cap = float(st.number_input("Capacité samedi (h)", 0.0, 24.0, DEFAULT_SATURDAY_CAPACITY_H, 0.5, disabled=not sat))
+            cleaning = int(st.number_input("Nettoyage si 2e couleur (min)", 0, 120, DEFAULT_CLEANING_MIN, 5))
+            solver = float(st.slider("Budget optimisation IA (s)", 6, 60, int(DEFAULT_SOLVER_SECONDS), 3))
+            st.info("Règle fixe: 1 couleur/jour privilégiée, 2 maximum.")
+        with st.expander("Contraintes manuelles"):
+            force_text = st.text_area("Forcer commandes cette semaine", placeholder="VTE2601234, VTE2605678")
+            exclude_text = st.text_area("Exclure commandes", placeholder="VTE2609999")
+        st.divider()
+        st.markdown("<span class='status-ok'>● Base GitHub connectée</span>", unsafe_allow_html=True)
+        st.caption(SOURCE_FILENAME)
+        st.caption("OR-Tools: " + ("actif" if ORTOOLS_AVAILABLE else "fallback local"))
+        st.caption(f"Version {VERSION}")
+
+    cfg = PlannerConfig(
+        year=year, week=week, capacity_h=cap,
+        saturday_enabled=sat, saturday_capacity_h=sat_cap,
+        cleaning_min=cleaning, minutes_per_bal=DEFAULT_MIN_PER_BAL,
+        powder_coeff=DEFAULT_POWDER_COEFF, target_utilization=DEFAULT_TARGET_UTIL,
+        solver_seconds=solver, max_jobs=DEFAULT_MAX_JOBS, pool_factor=DEFAULT_POOL_FACTOR,
+        allow_relaquage=DEFAULT_ALLOW_RELAQUAGE, strategy=objective,
+        force_commands=_parse_commands(force_text), exclude_commands=_parse_commands(exclude_text),
+    )
+
+    try:
+        source = _cached_source(str(SOURCE_PATH), SOURCE_PATH.stat().st_mtime_ns, SOURCE_PATH.stat().st_size)
+    except Exception as exc:
+        _top("Erreur de lecture", "Le moteur a arrêté le calcul pour protéger le planning.", cfg)
+        st.exception(exc)
+        return
+
+    signature = _source_signature(SOURCE_PATH, cfg)
+
+    def ensure_plan(force: bool = False):
+        if force or st.session_state.get("plan_signature") != signature or "plan_result" not in st.session_state:
+            with st.spinner("Agents IA: données → priorités → scénarios → optimisation → mono-couleur → réparation → validation..."):
+                st.session_state["plan_result"] = generate_agentic_plan(source, cfg)
+                st.session_state["plan_signature"] = signature
+        return st.session_state.get("plan_result")
+
+    if nav == "🤖 Planning IA":
+        _top("Planning IA", "Le fichier est lu depuis GitHub. Aucun upload manuel.", cfg)
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            st.markdown(f"<div class='card'><b>Source production</b><br><span class='subtitle'>{SOURCE_FILENAME}</span><br><span class='subtitle'>{format_num(len(source))} lignes détectées</span></div>", unsafe_allow_html=True)
+        with c2:
+            if st.button("↻ Régénérer", use_container_width=True):
+                ensure_plan(force=True)
+        with c3:
+            st.markdown("<div class='card'><b>Couleurs / jour</b><br><span class='subtitle'>1 privilégiée</span><br><span class='subtitle'>2 maximum</span></div>", unsafe_allow_html=True)
+
+        result = ensure_plan(False) if DEFAULT_AUTO_GENERATE else st.session_state.get("plan_result")
+        if result:
+            render_planning(result, cfg)
+
+    elif nav == "🏠 Tableau de bord":
+        _top("Tableau de bord", "Vue rapide des commandes et de la capacité de la semaine.", cfg)
+        master = learn_source_master(source, cfg.powder_coeff, cfg.minutes_per_bal)
+        lines, quality = build_candidate_lines(source, master, cfg)
+        overdue = int((pd.to_numeric(lines.get("_overdue_days"), errors="coerce").fillna(0) > 0).sum()) if not lines.empty else 0
+        unique_colors = int(lines["Couleur"].nunique()) if not lines.empty else 0
+        cols = st.columns(5)
+        vals = [
+            ("Commandes", format_num(source["NumCommande"].nunique()), "source GitHub"),
+            ("Lignes éligibles", format_num(len(lines)), "à planifier"),
+            ("Retards", str(overdue), "au début de semaine"),
+            ("Couleurs", str(unique_colors), "backlog éligible"),
+            ("Capacité", f"{sum(day_capacity_h(cfg,d) for d in range(6)):.0f} h", "semaine"),
+        ]
+        for col, val in zip(cols, vals):
+            with col:
+                _kpi(*val)
+        result = ensure_plan(False)
+        if result:
+            st.write("")
+            render_planning(result, cfg)
+
+    elif nav == "🧠 Analyse IA":
+        _top("Analyse IA", "Comparaison des stratégies, décisions des agents et backlog.", cfg)
+        result = ensure_plan(False)
+        st.markdown("#### Comparaison des scénarios")
+        st.dataframe(result["scenario_table"], hide_index=True, use_container_width=True)
+        left, right = st.columns(2)
+        with left:
+            st.markdown("#### Rapport des agents")
+            for agent, status, msg in result["steps"]:
+                cls = "agent agent-ok" if status == "OK" else "agent agent-warn"
+                st.markdown(f"<div class='{cls}'><b>{agent} · {status}</b><br><small>{msg}</small></div>", unsafe_allow_html=True)
+        with right:
+            st.markdown("#### Réparations autonomes")
+            if result["repair_log"]:
+                for msg in result["repair_log"]:
+                    st.write("• " + msg)
+            else:
+                st.success("Aucune réparation supplémentaire nécessaire.")
+            if result["data_notes"]:
+                with st.expander("Qualité des données"):
+                    for msg in result["data_notes"]:
+                        st.write("• " + msg)
+
+        st.markdown(f"#### Backlog hors semaine — {len(result['unscheduled'])} ligne(s)")
+        if result["unscheduled"].empty:
+            st.success("Tout le pool prioritaire tient dans la semaine.")
+        else:
+            cols = [c for c in ["NumCommande", "NomClient", "Article", "Couleur", "ResteALivrer", "NumOF", "ProdStatut", "tps", "_overdue_days", "_score", "_reason"] if c in result["unscheduled"].columns]
+            show = result["unscheduled"][cols].sort_values("_score", ascending=False).head(1000).rename(columns={"_overdue_days": "Retard jours", "_score": "Score IA", "_reason": "Raison IA"})
+            st.dataframe(show, hide_index=True, use_container_width=True, height=520)
+
+        with st.expander("Pourquoi les commandes sont placées ainsi ?"):
+            expl = explanation_table(result)
+            st.dataframe(expl.head(1500), hide_index=True, use_container_width=True, height=520)
+
+    else:
+        _top("Paramètres", "Règles transparentes utilisées par le moteur.", cfg)
+        rules = pd.DataFrame([
+            ["Fichier source", SOURCE_FILENAME],
+            ["Historique planning", "Aucun fichier historique requis"],
+            ["Couleurs / jour", "1 privilégiée · 2 maximum (dur)"],
+            ["Capacité Lun–Ven", f"{cfg.capacity_h:.1f} h/j"],
+            ["Samedi", f"{'Actif' if cfg.saturday_enabled else 'Inactif'} · {cfg.saturday_capacity_h:.1f} h"],
+            ["Cadence", f"{cfg.minutes_per_bal:.1f} min/bal"],
+            ["Poudre", f"coefficient {cfg.powder_coeff:.3f}"],
+            ["Nettoyage", f"{cfg.cleaning_min} min uniquement lorsqu'un jour contient 2 couleurs"],
+            ["Optimisation", "3 scénarios + CP-SAT OR-Tools + réparation agentique"],
+            ["Confiance 100%", "Toutes les règles du moteur validées; ce n'est pas une garantie de données terrain"],
+        ], columns=["Paramètre", "Valeur"])
+        st.dataframe(rules, hide_index=True, use_container_width=True)
+        st.info("Pour mettre à jour les commandes, remplacez Bd-Client-S36.xlsx dans GitHub puis redeployez. L'utilisateur n'importe aucun fichier dans l'application.")
+
+
+# =============================================================================
+# 15) CLI / TESTS AUTOMATIQUES
+# =============================================================================
+def cli_generate(source_path: str, output_path: str, year: int, week: int) -> Dict[str, Any]:
     source = load_source_workbook(Path(source_path).read_bytes())
-    history = load_historical_planning(Path(history_path).read_bytes()) if history_path else None
-    cfg = PlannerConfig(year=year, week=week, capacity_h=15.0, cleaning_min=0, max_colors_per_day=3, strategy="Équilibre")
-    result = generate_agentic_plan(source, history, cfg)
-    Path(output_path).write_bytes(export_planning_excel(result, include_summary=True))
+    cfg = PlannerConfig(year=year, week=week, strategy="Auto — meilleur compromis", solver_seconds=8)
+    result = generate_agentic_plan(source, cfg)
+    Path(output_path).write_bytes(export_planning_excel(result))
     return result
 
 
-def self_test(source_path: Optional[str] = None, history_path: Optional[str] = None) -> None:
-    checks = []
-    def check(name: str, fn):
-        fn(); checks.append(name); print(f"[OK] {name}")
+def self_test(source_path: Optional[str] = None) -> None:
+    checks: List[str] = []
 
-    check("Article split", lambda: (_ for _ in ()).throw(AssertionError()) if split_article("LMMO-S758-BLC") != ("LMMO-S758", "BLC") else None)
-    check("Excel serial date", lambda: (_ for _ in ()).throw(AssertionError()) if parse_date(46160) is None else None)
-    check("ISO week", lambda: (_ for _ in ()).throw(AssertionError()) if iso_week_dates(2026, 36)[0] != date(2026, 8, 31) else None)
+    def check(name: str, condition: bool, detail: Any = None):
+        if not condition:
+            raise AssertionError(f"{name}: {detail}")
+        checks.append(name)
+        print(f"[OK] {name}")
+
+    check("Article split", split_article("LMMO-S758-BLC") == ("LMMO-S758", "BLC"))
+    check("ISO semaine", iso_week_dates(2026, 36)[0] == date(2026, 8, 31))
+    check("Max couleur constant", HARD_MAX_COLORS_PER_DAY == 2)
+    check("Préférence mono-couleur", PREFERRED_COLORS_PER_DAY == 1)
 
     if source_path:
         src = load_source_workbook(Path(source_path).read_bytes())
-        hist = load_historical_planning(Path(history_path).read_bytes()) if history_path else None
-        master = learn_master(hist)
-        cfg = PlannerConfig(2026, 36, max_jobs=1000, pool_factor=2.0, solver_seconds=2)
+        cfg = PlannerConfig(2026, 36, strategy="Auto — meilleur compromis", solver_seconds=6, max_jobs=900, pool_factor=2.0)
+        master = learn_source_master(src, cfg.powder_coeff, cfg.minutes_per_bal)
         lines, quality = build_candidate_lines(src, master, cfg)
-        check("Source réel lu", lambda: (_ for _ in ()).throw(AssertionError()) if len(src) < 100 else None)
-        check("Lignes éligibles", lambda: (_ for _ in ()).throw(AssertionError()) if lines.empty else None)
-        if hist is not None and not hist.empty:
-            check("Cadence historique 4 min/bal", lambda: (_ for _ in ()).throw(AssertionError(master.minutes_per_bal)) if not (3.9 <= master.minutes_per_bal <= 4.1) else None)
-            check("Poudre historique 5.2%", lambda: (_ for _ in ()).throw(AssertionError(master.powder_coeff)) if not (0.051 <= master.powder_coeff <= 0.053) else None)
-        result = generate_agentic_plan(src, hist, cfg)
-        planned = sum(len(x) for x in result["days"].values())
-        check("Planning non vide", lambda: (_ for _ in ()).throw(AssertionError()) if planned <= 0 else None)
-        check("Capacité respectée", lambda: (_ for _ in ()).throw(AssertionError(result["metrics"])) if any(d["Charge totale h"] > cfg.capacity_h + 1e-6 for d in result["metrics"]["days"]) else None)
-        check("Format 28 colonnes", lambda: (_ for _ in ()).throw(AssertionError()) if any(list(business_day_df(result["days"][d]).columns) != OUTPUT_COLUMNS for d in range(6)) else None)
-        planned_df = pd.concat([d for d in result["days"].values() if not d.empty], ignore_index=True)
-        check("Lancement est une quantité", lambda: (_ for _ in ()).throw(AssertionError()) if planned_df["Lancement"].map(lambda x: isinstance(x, (datetime, date, pd.Timestamp))).any() else None)
-        check("Aucune fusion NumCommande", lambda: (_ for _ in ()).throw(AssertionError()) if planned_df["_line_id"].duplicated().any() else None)
+        check("Source réelle lue", len(src) > 100, len(src))
+        check("Lignes éligibles", not lines.empty)
+        check("Apprentissage poids source", master.source_weight_samples > 100, master.source_weight_samples)
+        result = generate_agentic_plan(src, cfg)
+        check("Planning non vide", sum(len(x) for x in result["days"].values()) > 0)
+        check("Confiance règles 100%", result["confidence"] == 100, result["hard_errors"])
+        check("Capacité respectée", all(d["Charge totale h"] <= d["Capacité h"] + 1e-6 for d in result["metrics"]["days"] if d["Capacité h"] > 0), result["metrics"]["days"])
+        check("Deux couleurs maximum", all(d["Nb couleurs"] <= 2 for d in result["metrics"]["days"]), result["metrics"]["days"])
+        check("Format 28 colonnes", all(list(business_day_df(result["days"][d]).columns) == OUTPUT_COLUMNS for d in range(6)))
+        planned_frames = [d for d in result["days"].values() if not d.empty]
+        planned = pd.concat(planned_frames, ignore_index=True) if planned_frames else pd.DataFrame()
+        check("Aucun doublon", planned.empty or not planned["_line_id"].duplicated().any())
         out = export_planning_excel(result)
-        check("Export Excel", lambda: (_ for _ in ()).throw(AssertionError()) if len(out) < 5000 else None)
+        check("Export Excel", len(out) > 7000, len(out))
+        wb = load_workbook(io.BytesIO(out), read_only=True, data_only=True)
+        check("6 feuilles planning", all(s in wb.sheetnames for s in SHEET_NAMES), wb.sheetnames)
+        check("Aucun historique requis", not (ROOT_DIR / "Planning S36.xlsx").exists())
+
     print(f"\n{len(checks)} test(s) OK")
 
 
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
-        src = None
-        hist = None
-        if "--input" in sys.argv:
-            src = sys.argv[sys.argv.index("--input") + 1]
-        if "--history" in sys.argv:
-            hist = sys.argv[sys.argv.index("--history") + 1]
-        self_test(src, hist)
+        src = sys.argv[sys.argv.index("--input") + 1] if "--input" in sys.argv else None
+        self_test(src)
     elif "--generate" in sys.argv:
         src = sys.argv[sys.argv.index("--input") + 1]
-        hist = sys.argv[sys.argv.index("--history") + 1] if "--history" in sys.argv else None
         out = sys.argv[sys.argv.index("--output") + 1]
         year = int(sys.argv[sys.argv.index("--year") + 1])
         week = int(sys.argv[sys.argv.index("--week") + 1])
-        r = cli_generate(src, hist, out, year, week)
+        r = cli_generate(src, out, year, week)
         print("Planning généré:", out)
-        print("Moteur:", r["engine"], "Charge:", r["metrics"]["total_load_h"], "h", "Confiance:", r["confidence"], "%")
+        print("Moteur:", r["engine"], "| confiance règles:", r["confidence"], "%")
     else:
         if st is None:
-            print("Installez Streamlit: pip install -r requirements.txt")
+            print("Installez les dépendances: pip install -r requirements.txt")
         else:
             render_ui()
