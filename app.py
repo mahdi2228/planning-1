@@ -29,11 +29,11 @@ LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
 # PALETTE / CSS
 # ==========================================================================
 
-COLOR_BG = "#F7F8FA"
+COLOR_BG = "#FBFCFE"
 COLOR_CARD = "#FFFFFF"
 COLOR_TEXT = "#172033"
-COLOR_TEXT_SECONDARY = "#667085"
-COLOR_BORDER = "#E5E7EB"
+COLOR_TEXT_SECONDARY = "#64748B"
+COLOR_BORDER = "#E7ECF2"
 COLOR_PRIMARY = "#2563EB"
 COLOR_SUCCESS = "#16A34A"
 COLOR_WARNING = "#F59E0B"
@@ -165,6 +165,119 @@ CUSTOM_CSS = f"""
     .stButton > button[kind="primary"] {{
         background-color: {COLOR_PRIMARY};
         border-color: {COLOR_PRIMARY};
+        color: #FFFFFF !important;
+    }}
+
+    /* ================================================================
+       THÈME CLAIR FORCÉ — identique en navigation normale et privée
+       ================================================================ */
+    html, body, .stApp, [data-testid="stAppViewContainer"] {{
+        color-scheme: light !important;
+        background: {COLOR_BG} !important;
+        color: {COLOR_TEXT} !important;
+    }}
+
+    [data-testid="stAppViewContainer"] > .main {{
+        background: {COLOR_BG} !important;
+    }}
+
+    /* Barre supérieure discrète + masquage des actions Streamlit
+       (étoile / édition / GitHub / menu selon la version hébergée). */
+    header[data-testid="stHeader"] {{
+        background: transparent !important;
+        box-shadow: none !important;
+    }}
+    [data-testid="stToolbar"],
+    [data-testid="stHeaderActionElements"],
+    [data-testid="stDecoration"],
+    [data-testid="stStatusWidget"],
+    [data-testid="stAppDeployButton"],
+    #MainMenu {{
+        display: none !important;
+        visibility: hidden !important;
+    }}
+
+    /* Sidebar claire */
+    section[data-testid="stSidebar"],
+    section[data-testid="stSidebar"] > div {{
+        background: #FFFFFF !important;
+        color: {COLOR_TEXT} !important;
+    }}
+
+    /* Champs et sélecteurs toujours blancs, même si le navigateur est sombre */
+    .stTextInput input,
+    .stNumberInput input,
+    .stDateInput input,
+    .stTimeInput input,
+    [data-baseweb="input"] input,
+    [data-baseweb="select"] > div,
+    [data-baseweb="textarea"] textarea {{
+        background-color: #FFFFFF !important;
+        color: {COLOR_TEXT} !important;
+        border-color: {COLOR_BORDER} !important;
+    }}
+
+    [data-baseweb="popover"],
+    [data-baseweb="menu"],
+    [role="listbox"] {{
+        background-color: #FFFFFF !important;
+        color: {COLOR_TEXT} !important;
+    }}
+
+    [role="option"],
+    [role="option"] span {{
+        color: {COLOR_TEXT} !important;
+    }}
+
+    /* Tabs, expanders et tableaux : look léger/professionnel */
+    [data-testid="stExpander"],
+    [data-testid="stDataFrame"],
+    [data-testid="stDataEditor"] {{
+        background: #FFFFFF !important;
+        border-color: {COLOR_BORDER} !important;
+        border-radius: 12px !important;
+    }}
+
+    button[data-baseweb="tab"] {{
+        color: {COLOR_TEXT_SECONDARY} !important;
+    }}
+    button[data-baseweb="tab"][aria-selected="true"] {{
+        color: {COLOR_PRIMARY} !important;
+    }}
+
+    /* Boutons secondaires */
+    .stButton > button:not([kind="primary"]) {{
+        background: #FFFFFF !important;
+        color: {COLOR_TEXT} !important;
+        border-color: {COLOR_BORDER} !important;
+    }}
+    .stButton > button:not([kind="primary"]):hover {{
+        background: #F8FAFC !important;
+        border-color: #CBD5E1 !important;
+    }}
+
+    /* Contraste lisible pour captions, labels et textes secondaires */
+    [data-testid="stCaptionContainer"],
+    [data-testid="stWidgetLabel"] p,
+    .stCaption {{
+        color: {COLOR_TEXT_SECONDARY} !important;
+    }}
+
+    /* Force encore le thème clair si le système / navigateur préfère le sombre */
+    @media (prefers-color-scheme: dark) {{
+        html, body, .stApp, [data-testid="stAppViewContainer"] {{
+            color-scheme: light !important;
+            background: {COLOR_BG} !important;
+            color: {COLOR_TEXT} !important;
+        }}
+        section[data-testid="stSidebar"],
+        section[data-testid="stSidebar"] > div,
+        [data-baseweb="popover"],
+        [data-baseweb="menu"],
+        [role="listbox"] {{
+            background: #FFFFFF !important;
+            color: {COLOR_TEXT} !important;
+        }}
     }}
 </style>
 """
