@@ -161,6 +161,11 @@ DEFAULT_POOL_FACTOR = float(PLAN_CFG.get("pool_factor", 2.7))
 PREFERRED_COLORS_PER_DAY = 1
 HARD_MAX_COLORS_PER_DAY = 2
 
+# Règle atelier supplémentaire: ne jamais enchaîner directement BLANC <-> NOIR.
+# Les alias couvrent les libellés les plus courants du fichier source.
+WHITE_COLOR_ALIASES = {"BLC", "BLANC", "WHITE", "R9016"}
+BLACK_COLOR_ALIASES = {"NOIR", "BLACK", "R9005"}
+
 # Sécurité / portail. Les valeurs locales ci-dessous répondent au besoin demandé.
 # En production, elles peuvent être remplacées par ALLUCO_ADMIN_USERNAME,
 # ALLUCO_ADMIN_PASSWORD[_HASH] et ALLUCO_CLIENT_ACCESS_CODE via secrets/env.
@@ -251,6 +256,36 @@ def automatic_planning_week(reference_date: Optional[date] = None) -> Tuple[int,
     target = ref if ref.weekday() <= 2 else ref + timedelta(days=7)
     iso = target.isocalendar()
     return int(iso.year), int(iso.week)
+
+
+def _color_class(color: Any) -> str:
+    c = norm_text(color).upper()
+    if c in WHITE_COLOR_ALIASES:
+        return "WHITE"
+    if c in BLACK_COLOR_ALIASES:
+        return "BLACK"
+    return "OTHER"
+
+
+def _white_black_conflict(colors_a: Iterable[Any], colors_b: Optional[Iterable[Any]] = None) -> bool:
+    """Détecte un conflit BLANC/NOIR dans un même groupe ou entre deux groupes."""
+    a = {_color_class(c) for c in colors_a if norm_text(c)}
+    if colors_b is None:
+        return "WHITE" in a and "BLACK" in a
+    b = {_color_class(c) for c in colors_b if norm_text(c)}
+    return ("WHITE" in a and "BLACK" in b) or ("BLACK" in a and "WHITE" in b)
+
+
+def _placement_breaks_white_black_sequence(color: Any, d: int, colors_by_day: Sequence[set]) -> bool:
+    """Interdit BLANC/NOIR le même jour et sur deux jours consécutifs, dans les deux sens."""
+    proposed = set(colors_by_day[d]) | {norm_text(color).upper()}
+    if _white_black_conflict(proposed):
+        return True
+    if d > 0 and _white_black_conflict(proposed, colors_by_day[d - 1]):
+        return True
+    if d < len(colors_by_day) - 1 and _white_black_conflict(proposed, colors_by_day[d + 1]):
+        return True
+    return False
 
 
 def _looks_like_color_token(token: str) -> bool:
@@ -978,6 +1013,22 @@ def assign_jobs_ortools(jobs: List[Job], cfg: PlannerConfig) -> Tuple[Dict[str, 
         model.Add(dev >= load - target)
         objective.append(dev * w["balance"])
 
+    # Règle dure BLANC <-> NOIR: jamais le même jour ni deux jours consécutifs.
+    white_colors = [c for c in colors if _color_class(c) == "WHITE"]
+    black_colors = [c for c in colors if _color_class(c) == "BLACK"]
+    for d in range(6):
+        for wc in white_colors:
+            for bc in black_colors:
+                if (d, wc) in y and (d, bc) in y:
+                    model.Add(y[(d, wc)] + y[(d, bc)] <= 1)
+    for d in range(5):
+        for wc in white_colors:
+            for bc in black_colors:
+                if (d, wc) in y and (d + 1, bc) in y:
+                    model.Add(y[(d, wc)] + y[(d + 1, bc)] <= 1)
+                if (d, bc) in y and (d + 1, wc) in y:
+                    model.Add(y[(d, bc)] + y[(d + 1, wc)] <= 1)
+
     # même commande: limiter la dispersion sur plusieurs jours.
     for ci, cmd in enumerate(commands):
         idxs = by_command[cmd]
@@ -1021,6 +1072,8 @@ def assign_jobs_ortools(jobs: List[Job], cfg: PlannerConfig) -> Tuple[Dict[str, 
 def _fallback_day_cost(job: Job, d: int, loads: List[int], colors_by_day: List[set], commands_by_day: List[set], cfg: PlannerConfig) -> float:
     cap = day_capacity_min(cfg, d)
     if cap <= 0:
+        return float("inf")
+    if _placement_breaks_white_black_sequence(job.color, d, colors_by_day):
         return float("inf")
     new_color = job.color not in colors_by_day[d]
     ncolors = len(colors_by_day[d]) + (1 if new_color else 0)
@@ -1114,6 +1167,8 @@ def _can_place(job: Job, d: int, loads: List[int], colors: List[set], cfg: Plann
         return False
     current_colors = set(colors[d])
     current_load = loads[d]
+    if _placement_breaks_white_black_sequence(job.color, d, colors):
+        return False
     if remove_job is not None:
         current_load -= remove_job.duration_min
         # exact color recalculation requires day job list; caller only uses remove_job from same color swap conservatively.
@@ -1159,6 +1214,14 @@ def repair_assignments(jobs: List[Job], assignments: Dict[str, int], unscheduled
                 clean_before = cfg.cleaning_min if len(target_colors) == 2 else 0
                 prod_target = loads[target] - clean_before
                 projected_colors = set(target_colors) | ({minority} if move_ids else set())
+                trial_colors = [set(x) for x in colors]
+                trial_colors[target] = projected_colors
+                if _white_black_conflict(projected_colors):
+                    continue
+                if target > 0 and _white_black_conflict(projected_colors, trial_colors[target - 1]):
+                    continue
+                if target < 5 and _white_black_conflict(projected_colors, trial_colors[target + 1]):
+                    continue
                 clean_after = cfg.cleaning_min if len(projected_colors) == 2 else 0
                 if prod_target + total + clean_after <= day_capacity_min(cfg, target):
                     moved_to = target
@@ -1329,6 +1392,18 @@ def validate_plan(days: Dict[int, pd.DataFrame], lines: pd.DataFrame, cfg: Plann
             hard.append(f"{dm['Jour']}: {dm['Nb couleurs']} couleurs > maximum 2.")
         if dm["Nb couleurs"] == 2:
             soft.append(f"{dm['Jour']}: 2 couleurs utilisées; 1 couleur reste la cible préférée.")
+
+    # Contrôle de séquence BLANC/NOIR.
+    day_colors = []
+    for d in range(6):
+        df_day = days.get(d, pd.DataFrame())
+        colors_day = set(df_day.get("Couleur", pd.Series(dtype=str)).dropna().astype(str).str.upper().tolist()) if df_day is not None else set()
+        day_colors.append(colors_day)
+        if _white_black_conflict(colors_day):
+            hard.append(f"{DAYS[d]}: BLANC et NOIR ne peuvent pas être enchaînés le même jour.")
+    for d in range(5):
+        if _white_black_conflict(day_colors[d], day_colors[d + 1]):
+            hard.append(f"Transition interdite {DAYS[d]} -> {DAYS[d + 1]}: BLANC <-> NOIR.")
 
     planned_frames = [d for d in days.values() if d is not None and not d.empty]
     planned = pd.concat(planned_frames, ignore_index=True) if planned_frames else pd.DataFrame()
@@ -1803,7 +1878,7 @@ section[data-testid="stSidebar"],section[data-testid="stSidebar"]>div{{backgroun
 [data-testid="stSidebarCollapsedControl"]{{position:fixed!important;top:.55rem!important;left:.55rem!important}}
 h1,h2,h3,h4,h5,h6,p,label,span,div{{color:var(--ink)}}
 [data-testid="stCaptionContainer"],.stCaption{{color:var(--muted)!important}}
-.brand{{display:flex;align-items:center;gap:.75rem;margin:.2rem 0 1rem}}.brandlogo{{width:118px;max-width:48%;height:52px;object-fit:contain;object-position:left center;display:block}}.brandmark{{width:44px;height:44px;border-radius:13px;background:linear-gradient(145deg,{theme['hero1']},{theme['hero2']});color:#fff!important;display:flex;align-items:center;justify-content:center;font-weight:950;font-size:1.4rem;box-shadow:0 8px 20px rgba(21,94,239,.18)}}.brandname{{font-weight:950;font-size:1.05rem;letter-spacing:.06em}}.brandsub{{font-size:.72rem;color:var(--muted)!important}}
+.brand{{display:flex;align-items:center;gap:.75rem;margin:.2rem 0 1.15rem}}.brandlogo{{width:190px;max-width:78%;height:84px;object-fit:contain;object-position:left center;display:block}}.brandmark{{width:44px;height:44px;border-radius:13px;background:linear-gradient(145deg,{theme['hero1']},{theme['hero2']});color:#fff!important;display:flex;align-items:center;justify-content:center;font-weight:950;font-size:1.4rem;box-shadow:0 8px 20px rgba(21,94,239,.18)}}.brandname{{font-weight:950;font-size:1.05rem;letter-spacing:.06em}}.brandsub{{font-size:.72rem;color:var(--muted)!important}}
 .topbar{{display:flex;justify-content:space-between;align-items:center;gap:1rem;margin:.2rem 0 1rem}}.title{{font-size:1.55rem;font-weight:950;letter-spacing:-.025em}}.subtitle{{font-size:.86rem;color:var(--muted)!important;margin-top:.15rem}}.headbadges{{display:flex;align-items:center;justify-content:flex-end;gap:.45rem;flex-wrap:wrap}}.todaybadge,.weekbadge{{background:var(--softblue);color:var(--blue)!important;border:1px solid var(--line);padding:.42rem .72rem;border-radius:999px;font-weight:850;font-size:.78rem;white-space:nowrap}}.todaybadge{{background:var(--card);color:var(--muted)!important}}
 .hero{{background:linear-gradient(135deg,{theme['hero1']} 0%,{theme['hero2']} 100%);border-radius:20px;padding:1.3rem 1.45rem;margin-bottom:1rem;box-shadow:0 12px 30px rgba(21,94,239,.12)}}.hero *{{color:#fff!important}}.hero-title{{font-weight:950;font-size:1.28rem}}.hero-sub{{opacity:.92;font-size:.89rem;margin-top:.35rem;max-width:1050px}}
 .card,.client-card{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:1rem 1.1rem;box-shadow:0 1px 3px rgba(16,24,40,.06)}}
@@ -2168,6 +2243,111 @@ def export_client_report_excel(command: str, rows: pd.DataFrame, plan_entry: Opt
     return out.getvalue()
 
 
+def export_client_report_pdf(command: str, rows: pd.DataFrame, plan_entry: Optional[Dict[str, Any]], published: Optional[Dict[str, Any]]) -> bytes:
+    """Exporte le rapport client en PDF, en complément de l'Excel existant."""
+    if not REPORTLAB_AVAILABLE:
+        raise RuntimeError("ReportLab n'est pas installé; export PDF indisponible.")
+
+    detail = _client_detail_table(rows)
+    out = io.BytesIO()
+    c = pdf_canvas.Canvas(out, pagesize=A4)
+    width, height = A4
+    c.setTitle(f"ALLUCO Rapport commande {command}")
+    logo_bytes, _ = _pdf_brand_logo()
+
+    def draw_header(page_title: str) -> float:
+        y = height - 42
+        if logo_bytes:
+            try:
+                img = ImageReader(io.BytesIO(logo_bytes))
+                c.drawImage(img, 36, height - 82, width=145, height=52, preserveAspectRatio=True, anchor='w', mask='auto')
+            except Exception:
+                c.setFont("Helvetica-Bold", 15)
+                c.drawString(36, y, "ALLUCO")
+        else:
+            c.setFont("Helvetica-Bold", 15)
+            c.drawString(36, y, "ALLUCO")
+        c.setFont("Helvetica-Bold", 15)
+        c.drawString(196, y, page_title[:55])
+        c.setLineWidth(0.5)
+        c.line(36, height - 92, width - 36, height - 92)
+        return height - 116
+
+    y = draw_header(f"Rapport commande {command}")
+    ordered = int(pd.to_numeric(rows.get("QteCommandé", pd.Series(dtype=float)), errors="coerce").fillna(0).clip(lower=0).sum())
+    remaining = int(pd.to_numeric(rows.get("ResteALivrer", pd.Series(dtype=float)), errors="coerce").fillna(0).clip(lower=0).sum())
+    delivered = max(0, ordered - remaining)
+    clients = [norm_text(x) for x in rows.get("NomClient", pd.Series(dtype=str)).tolist() if norm_text(x)]
+    client = " / ".join(dict.fromkeys(clients)) or "-"
+    status = _client_order_status(rows, plan_entry)
+
+    summary = [
+        ("Commande", command),
+        ("Client", client),
+        ("Statut", status),
+        ("Quantite commandee", str(ordered)),
+        ("Livre estime", str(delivered)),
+        ("Reste a livrer", str(remaining)),
+    ]
+    if plan_entry and plan_entry.get("status") == "PLANIFIÉ":
+        days = " / ".join(f"{x.get('day', '')} {x.get('date', '')}" for x in plan_entry.get("days", []))
+        summary.append(("Planning", days or "Planifie"))
+    elif plan_entry:
+        summary.append(("Planning", norm_text(plan_entry.get("status")) or "-"))
+    if published:
+        summary.append(("Publication", f"S{published.get('week')} / {published.get('year')} - {published.get('published_at')}"))
+
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(36, y, "Resume")
+    y -= 20
+    for key, value in summary:
+        c.setFont("Helvetica-Bold", 8.5)
+        c.drawString(36, y, str(key)[:24])
+        c.setFont("Helvetica", 8.5)
+        c.drawString(155, y, str(value)[:70])
+        y -= 15
+
+    y -= 10
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(36, y, "Detail de la commande")
+    y -= 18
+
+    headers = ["Ligne", "Article", "Couleur", "Commande", "Livre", "Reste", "OF", "Echeance"]
+    xs = [36, 68, 205, 268, 323, 370, 415, 490]
+
+    def draw_table_header(ypos: float) -> float:
+        c.setFont("Helvetica-Bold", 7)
+        for x, h in zip(xs, headers):
+            c.drawString(x, ypos, h)
+        c.line(36, ypos - 4, width - 36, ypos - 4)
+        return ypos - 15
+
+    y = draw_table_header(y)
+    c.setFont("Helvetica", 6.8)
+    for _, r in detail.iterrows():
+        if y < 45:
+            c.showPage()
+            y = draw_header(f"Rapport commande {command} - suite")
+            y = draw_table_header(y)
+            c.setFont("Helvetica", 6.8)
+        vals = [
+            str(r.get("Ligne", "")),
+            norm_text(r.get("Article"))[:22],
+            norm_text(r.get("Couleur"))[:10],
+            str(r.get("Commandé", "")),
+            str(r.get("Livré estimé", "")),
+            str(r.get("Reste à livrer", "")),
+            norm_text(r.get("N° OF"))[:11],
+            norm_text(r.get("Échéance"))[:10],
+        ]
+        for x, v in zip(xs, vals):
+            c.drawString(x, y, v)
+        y -= 12
+
+    c.save()
+    return out.getvalue()
+
+
 def render_client_portal(source: pd.DataFrame, cfg: PlannerConfig, source_signature: str) -> None:
     _top("Suivi de commande", "Rapport client sécurisé, clair et actualisé depuis la base de production.", cfg)
     st.markdown("<div class='hero'><div class='hero-title'>Consulter une commande</div><div class='hero-sub'>Saisissez le numéro exact de commande pour afficher son avancement, ses quantités, ses échéances et sa position dans le dernier planning publié.</div></div>", unsafe_allow_html=True)
@@ -2267,13 +2447,36 @@ def render_client_portal(source: pd.DataFrame, cfg: PlannerConfig, source_signat
     st.dataframe(detail, hide_index=True, use_container_width=True, height=min(520, 84 + len(detail) * 35))
 
     report_bytes = export_client_report_excel(command, rows, plan_entry, published)
-    st.download_button(
-        "Télécharger le rapport Excel",
-        data=report_bytes,
-        file_name=f"Rapport_Commande_{re.sub(r'[^A-Z0-9_-]+', '_', command)}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    safe_command = re.sub(r'[^A-Z0-9_-]+', '_', command)
+    if REPORTLAB_AVAILABLE:
+        pdf_bytes = export_client_report_pdf(command, rows, plan_entry, published)
+        dl_excel, dl_pdf = st.columns(2)
+        with dl_excel:
+            st.download_button(
+                "Télécharger le rapport Excel",
+                data=report_bytes,
+                file_name=f"Rapport_Commande_{safe_command}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        with dl_pdf:
+            st.download_button(
+                "Télécharger le rapport PDF",
+                data=pdf_bytes,
+                file_name=f"Rapport_Commande_{safe_command}.pdf",
+                mime="application/pdf",
+                type="primary",
+                use_container_width=True,
+            )
+    else:
+        st.download_button(
+            "Télécharger le rapport Excel",
+            data=report_bytes,
+            file_name=f"Rapport_Commande_{safe_command}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        st.caption("Export PDF client indisponible: installez reportlab pour l'activer.")
 
 
 def render_ui() -> None:
@@ -2395,6 +2598,12 @@ def render_ui() -> None:
             st.markdown(f"<div class='card'><b>Source production</b><br><span class='subtitle'>{_esc(SOURCE_FILENAME)}</span><br><span class='subtitle'>{format_num(len(source))} lignes détectées</span></div>", unsafe_allow_html=True)
         with c2:
             regenerate = st.button("Régénérer", use_container_width=True)
+        if regenerate:
+            # À chaque régénération, recaler le planning sur la semaine automatique du jour.
+            # Jeudi/Vendredi -> semaine suivante, puis affichage fixe Lundi -> Samedi.
+            regen_year, regen_week = automatic_planning_week(app_today())
+            cfg = dc_replace(cfg, year=regen_year, week=regen_week)
+            signature = _source_signature(SOURCE_PATH, cfg)
         with c3:
             st.markdown("<div class='card'><b>Couleurs / jour</b><br><span class='subtitle'>1 privilégiée</span><br><span class='subtitle'>2 maximum</span></div>", unsafe_allow_html=True)
         try:
@@ -2478,6 +2687,7 @@ def render_ui() -> None:
             ["Fichier source", SOURCE_FILENAME],
             ["Historique planning", "Aucun fichier historique requis"],
             ["Couleurs / jour", "1 privilégiée · 2 maximum (dur)"],
+            ["Séquence blanc/noir", "Transition directe BLANC <-> NOIR interdite"],
             ["Capacité Lun–Ven", f"{cfg.capacity_h:.1f} h/j"],
             ["Samedi", f"{'Actif' if cfg.saturday_enabled else 'Inactif'} · {cfg.saturday_capacity_h:.1f} h"],
             ["Cadence", f"{cfg.minutes_per_bal:.1f} min/bal"],
@@ -2517,6 +2727,9 @@ def modification_self_test() -> None:
     check("Mercredi garde semaine courante", automatic_planning_week(date(2026, 9, 2)) == (2026, 36))
     check("Jeudi passe semaine suivante", automatic_planning_week(date(2026, 9, 3)) == (2026, 37))
     check("Vendredi passe semaine suivante", automatic_planning_week(date(2026, 9, 4)) == (2026, 37))
+    check("Ordre planning Lundi-Samedi", DAYS == ["LUNDI", "MARDI", "MERCREDI", "JEUDI", "VENDREDI", "SAMEDI"])
+    check("Blanc-Noir même jour interdit", _white_black_conflict({"BLC", "NOIR"}))
+    check("Blanc-Noir jours consécutifs interdit", _white_black_conflict({"BLC"}, {"NOIR"}) and _white_black_conflict({"NOIR"}, {"BLC"}))
 
     d37 = iso_week_dates(2026, 37)
     check("S37 du 07/09 au 12/09", d37[0] == date(2026, 9, 7) and d37[5] == date(2026, 9, 12), d37)
@@ -2539,6 +2752,7 @@ def modification_self_test() -> None:
                 os.environ[key] = value
 
     css = build_css(False)
+    check("Logo agrandi", "width:190px" in css and "height:84px" in css)
     check(
         "Toolbar Share étoile Edit GitHub masquée",
         '[data-testid="stToolbar"]' in css
@@ -2555,7 +2769,7 @@ def modification_self_test() -> None:
         data, source = load_brand_logo(root)
         check("Logo embarqué OK", source == "embedded-base64" and data == embedded and len(data) > 0)
 
-    print(f"\n{len(checks)}/8 tests internes OK")
+    print(f"\n{len(checks)} tests internes OK")
 
 
 def self_test(source_path: Optional[str] = None) -> None:
