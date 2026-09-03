@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-ALLUCO — Planning Laquage Agentic IA V6
+ALLUCO — Planning Laquage Agentic IA V5
 =======================================
-Application monofichier Streamlit: planning agentique, administration sécurisée et portail client.
+Un seul fichier Python, prêt pour GitHub / Streamlit Cloud.
 
 Entrée:
     Bd-Client-S36.xlsx (versionné avec le dépôt, aucun upload utilisateur)
@@ -25,8 +25,6 @@ constitue pas une garantie de réalité terrain si les données sources sont inc
 from __future__ import annotations
 
 import hashlib
-import hmac
-import html
 import io
 import json
 import math
@@ -68,9 +66,9 @@ except Exception:
 # =============================================================================
 # 1) CONFIGURATION
 # =============================================================================
-VERSION = "6.0.0"
+VERSION = "5.0.0"
 APP_NAME = "ALLUCO — Planning Laquage IA"
-APP_SUBTITLE = "Agentic AI · Planning industriel · Portail Client"
+APP_SUBTITLE = "Agentic AI · Planification automatique"
 ROOT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT_DIR / "config.toml"
 
@@ -138,16 +136,6 @@ DEFAULT_MAX_JOBS = int(PLAN_CFG.get("max_jobs", 1600))
 DEFAULT_POOL_FACTOR = float(PLAN_CFG.get("pool_factor", 2.7))
 PREFERRED_COLORS_PER_DAY = 1
 HARD_MAX_COLORS_PER_DAY = 2
-
-# Sécurité / portail. Laisser les valeurs locales vides en production et utiliser
-# ALLUCO_ADMIN_PASSWORD[_HASH] / ALLUCO_CLIENT_ACCESS_CODE via secrets ou variables d’environnement.
-LOCAL_ADMIN_PASSWORD = ""
-LOCAL_CLIENT_ACCESS_CODE = ""
-PBKDF2_ITERATIONS = 310_000
-AUTH_MAX_ATTEMPTS = 5
-AUTH_LOCK_SECONDS = 60
-CLIENT_MAX_QUERIES_PER_MINUTE = 20
-
 
 
 # =============================================================================
@@ -253,92 +241,6 @@ def format_num(v: float, digits: int = 0) -> str:
     if digits == 0:
         return f"{v:,.0f}".replace(",", " ")
     return f"{v:,.{digits}f}".replace(",", " ")
-
-
-def _runtime_secret(name: str, local_default: str = "") -> str:
-    value = os.environ.get(name, "")
-    if value:
-        return str(value)
-    if st is not None:
-        try:
-            if name in st.secrets:
-                value = st.secrets[name]
-                if value is not None:
-                    return str(value)
-        except Exception:
-            pass
-    return str(local_default or "")
-
-
-def make_password_hash(password: str, iterations: int = PBKDF2_ITERATIONS) -> str:
-    if not password:
-        raise ValueError("Mot de passe vide interdit.")
-    salt = os.urandom(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations))
-    return f"pbkdf2_sha256${int(iterations)}${salt.hex()}${digest.hex()}"
-
-
-def verify_password_hash(password: str, encoded: str) -> bool:
-    try:
-        scheme, iterations, salt_hex, digest_hex = str(encoded).split("$", 3)
-        if scheme != "pbkdf2_sha256":
-            return False
-        expected = bytes.fromhex(digest_hex)
-        actual = hashlib.pbkdf2_hmac(
-            "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), int(iterations)
-        )
-        return hmac.compare_digest(actual, expected)
-    except Exception:
-        return False
-
-
-def verify_admin_password(password: str) -> bool:
-    encoded = _runtime_secret("ALLUCO_ADMIN_PASSWORD_HASH")
-    if encoded:
-        return verify_password_hash(password, encoded)
-    plain = _runtime_secret("ALLUCO_ADMIN_PASSWORD", LOCAL_ADMIN_PASSWORD)
-    return bool(plain) and hmac.compare_digest(str(password), str(plain))
-
-
-def admin_auth_configured() -> bool:
-    return bool(
-        _runtime_secret("ALLUCO_ADMIN_PASSWORD_HASH")
-        or _runtime_secret("ALLUCO_ADMIN_PASSWORD", LOCAL_ADMIN_PASSWORD)
-    )
-
-
-def client_access_code() -> str:
-    return _runtime_secret("ALLUCO_CLIENT_ACCESS_CODE", LOCAL_CLIENT_ACCESS_CODE)
-
-
-def safe_error_id(exc: Exception) -> str:
-    raw = f"{type(exc).__name__}|{exc}|{time.time_ns()}"
-    return "ERR-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10].upper()
-
-
-def source_file_signature(path: Path) -> str:
-    payload = f"{path.resolve()}|{path.stat().st_mtime_ns}|{path.stat().st_size}"
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-
-def _esc(value: Any) -> str:
-    return html.escape(norm_text(value), quote=True)
-
-
-def _client_query_allowed() -> bool:
-    if st is None:
-        return True
-    now = time.time()
-    history = [
-        float(x) for x in st.session_state.get("client_query_history", [])
-        if now - float(x) < 60.0
-    ]
-    if len(history) >= CLIENT_MAX_QUERIES_PER_MINUTE:
-        st.session_state["client_query_history"] = history
-        return False
-    history.append(now)
-    st.session_state["client_query_history"] = history
-    return True
 
 
 # =============================================================================
@@ -1283,11 +1185,6 @@ def _assemble(lines: pd.DataFrame, quality: Dict[str, Any], selected_jobs: List[
 
     metrics = planning_metrics(days, cfg, unscheduled)
     hard, soft, confidence = validate_plan(days, lines, cfg)
-    forced_unscheduled = unscheduled[unscheduled.get("_forced", False) == True] if not unscheduled.empty and "_forced" in unscheduled.columns else pd.DataFrame()
-    if not forced_unscheduled.empty:
-        forced_cmds = sorted(set(forced_unscheduled["NumCommande"].astype(str)))
-        hard.append("Commande(s) forcée(s) non planifiée(s): " + ", ".join(forced_cmds[:12]))
-        confidence = max(0, 100 - min(100, len(hard) * 25))
     notes = data_quality_notes(lines, quality)
 
     weighted_backlog = float(pd.to_numeric(unscheduled.get("_score", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not unscheduled.empty else 0.0
@@ -1548,47 +1445,81 @@ def export_planning_excel(result: Dict[str, Any]) -> bytes:
 # =============================================================================
 # 14) UI / DESIGN
 # =============================================================================
-def build_css(dark: bool = False) -> str:
-    if dark:
-        theme = {
-            "bg": "#0B1220", "card": "#111827", "surface": "#172033", "ink": "#F3F6FC",
-            "muted": "#A7B0C0", "line": "#2B3648", "blue": "#6EA8FE", "navy": "#244C7A",
-            "green": "#4ADE80", "amber": "#FBBF24", "red": "#FB7185", "hero1": "#17365D",
-            "hero2": "#1D4ED8", "input": "#0F172A", "softblue": "#132442"
-        }
-        scheme = "dark"
-    else:
-        theme = {
-            "bg": "#F5F7FB", "card": "#FFFFFF", "surface": "#FFFFFF", "ink": "#172033",
-            "muted": "#667085", "line": "#E4E9F0", "blue": "#155EEF", "navy": "#14365A",
-            "green": "#067647", "amber": "#B54708", "red": "#B42318", "hero1": "#123B67",
-            "hero2": "#155EEF", "input": "#FFFFFF", "softblue": "#EEF4FF"
-        }
-        scheme = "light"
-    return f"""
+CSS = r"""
 <style>
-:root{{--bg:{theme['bg']};--card:{theme['card']};--surface:{theme['surface']};--ink:{theme['ink']};--muted:{theme['muted']};--line:{theme['line']};--blue:{theme['blue']};--navy:{theme['navy']};--green:{theme['green']};--amber:{theme['amber']};--red:{theme['red']};--input:{theme['input']};--softblue:{theme['softblue']}}}
-html,body,.stApp,[data-testid="stAppViewContainer"]{{background:var(--bg)!important;color:var(--ink)!important;color-scheme:{scheme}!important}}
-header[data-testid="stHeader"]{{background:color-mix(in srgb,var(--bg) 94%,transparent)!important;box-shadow:none!important}}
-#MainMenu,footer,[data-testid="stAppDeployButton"],[data-testid="stHeaderActionElements"],[data-testid="stMainMenu"],[data-testid="stStatusWidget"]{{display:none!important;visibility:hidden!important}}
-header button[title="Share"],header button[aria-label="Share"],header a[aria-label*="GitHub"],header button[aria-label*="GitHub"],header button[title="Edit"]{{display:none!important}}
-.block-container{{max-width:1520px;padding-top:1rem;padding-bottom:2rem}}
-section[data-testid="stSidebar"],section[data-testid="stSidebar"]>div{{background:var(--card)!important;border-right:1px solid var(--line)}}
-h1,h2,h3,h4,h5,h6,p,label,span,div{{color:var(--ink)}}
-[data-testid="stCaptionContainer"],.stCaption{{color:var(--muted)!important}}
-.brand{{display:flex;align-items:center;gap:.75rem;margin:.2rem 0 1rem}}.brandmark{{width:44px;height:44px;border-radius:13px;background:linear-gradient(145deg,{theme['hero1']},{theme['hero2']});color:#fff!important;display:flex;align-items:center;justify-content:center;font-weight:950;font-size:1.4rem;box-shadow:0 8px 20px rgba(21,94,239,.18)}}.brandname{{font-weight:950;font-size:1.05rem;letter-spacing:.06em}}.brandsub{{font-size:.72rem;color:var(--muted)!important}}
-.topbar{{display:flex;justify-content:space-between;align-items:center;margin:.2rem 0 1rem}}.title{{font-size:1.55rem;font-weight:950;letter-spacing:-.025em}}.subtitle{{font-size:.86rem;color:var(--muted)!important;margin-top:.15rem}}.weekbadge{{background:var(--softblue);color:var(--blue)!important;border:1px solid var(--line);padding:.42rem .72rem;border-radius:999px;font-weight:850;font-size:.78rem}}
-.hero{{background:linear-gradient(135deg,{theme['hero1']} 0%,{theme['hero2']} 100%);border-radius:20px;padding:1.3rem 1.45rem;margin-bottom:1rem;box-shadow:0 12px 30px rgba(21,94,239,.12)}}.hero *{{color:#fff!important}}.hero-title{{font-weight:950;font-size:1.28rem}}.hero-sub{{opacity:.92;font-size:.89rem;margin-top:.35rem;max-width:1050px}}
-.card,.client-card{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:1rem 1.1rem;box-shadow:0 1px 3px rgba(16,24,40,.06)}}
-.kpi{{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:.86rem 1rem;min-height:98px}}.kpi-l{{font-size:.70rem;font-weight:850;color:var(--muted)!important;text-transform:uppercase;letter-spacing:.05em}}.kpi-v{{font-size:1.42rem;font-weight:950;margin-top:.25rem}}.kpi-s{{font-size:.72rem;color:var(--muted)!important;margin-top:.15rem}}
-.status-ok{{display:inline-flex;align-items:center;gap:.35rem;color:var(--green)!important;background:color-mix(in srgb,var(--green) 10%,var(--card));border:1px solid color-mix(in srgb,var(--green) 35%,var(--line));padding:.34rem .58rem;border-radius:999px;font-size:.75rem;font-weight:850}}.status-warn{{display:inline-flex;align-items:center;gap:.35rem;color:var(--amber)!important;background:color-mix(in srgb,var(--amber) 10%,var(--card));border:1px solid color-mix(in srgb,var(--amber) 35%,var(--line));padding:.34rem .58rem;border-radius:999px;font-size:.75rem;font-weight:850}}.status-err{{display:inline-flex;align-items:center;gap:.35rem;color:var(--red)!important;background:color-mix(in srgb,var(--red) 10%,var(--card));border:1px solid color-mix(in srgb,var(--red) 35%,var(--line));padding:.34rem .58rem;border-radius:999px;font-size:.75rem;font-weight:850}}
-.agent{{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:.68rem .8rem;margin:.35rem 0}}.agent-ok{{border-left:4px solid var(--green)}}.agent-warn{{border-left:4px solid var(--amber)}}.agent b{{font-size:.83rem}}.agent small{{color:var(--muted)!important}}
-[data-testid="stMetric"]{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:.72rem .9rem}}.stButton>button,.stDownloadButton>button{{border-radius:10px;font-weight:800;border:1px solid var(--line);min-height:42px;background:var(--card);color:var(--ink)!important}}.stButton>button[kind="primary"]{{background:var(--blue);border-color:var(--blue);color:#fff!important}}.stButton>button[kind="primary"] *{{color:#fff!important}}
-[data-testid="stDataFrame"],[data-testid="stDataEditor"]{{background:var(--card);border:1px solid var(--line);border-radius:14px;overflow:hidden}}button[data-baseweb="tab"]{{font-weight:800}}button[data-baseweb="tab"][aria-selected="true"]{{color:var(--blue)!important}}
-[data-baseweb="input"]>div,[data-baseweb="select"]>div,textarea,input{{background:var(--input)!important;color:var(--ink)!important;border-color:var(--line)!important}}
-.client-head{{display:flex;justify-content:space-between;gap:1rem;align-items:flex-start;flex-wrap:wrap}}.client-order{{font-size:1.32rem;font-weight:950}}.client-meta{{color:var(--muted)!important;font-size:.82rem;margin-top:.2rem}}.progress-wrap{{background:var(--line);height:10px;border-radius:999px;overflow:hidden;margin-top:.55rem}}.progress-bar{{height:100%;background:var(--blue);border-radius:999px}}
-hr{{border-color:var(--line)!important}}
-@media(max-width:900px){{.block-container{{padding-left:.75rem;padding-right:.75rem}}.topbar{{align-items:flex-start;flex-direction:column;gap:.55rem}}.hero{{padding:1rem}}}}
+:root{--bg:#F5F7FB;--card:#FFFFFF;--ink:#172033;--muted:#667085;--line:#E4E9F0;--blue:#155EEF;--navy:#14365A;--green:#067647;--amber:#B54708;--red:#B42318}
+html,body,.stApp,[data-testid="stAppViewContainer"]{background:var(--bg)!important;color:var(--ink)!important;color-scheme:light!important}
+header[data-testid="stHeader"]{background:rgba(245,247,251,.94)!important;box-shadow:none!important}
+/* Masquer uniquement les actions Streamlit à droite du header.
+   IMPORTANT : on ne masque PAS tout le header / stToolbar afin de garder
+   le bouton natif qui permet de fermer et rouvrir la sidebar. */
+#MainMenu,
+footer,
+[data-testid="stAppDeployButton"],
+[data-testid="stHeaderActionElements"],
+[data-testid="stToolbarActions"],
+.stToolbarActions,
+[data-testid="stToolbarActionButton"],
+.stToolbarActionButton,
+[data-testid="stMainMenu"],
+[data-testid="stStatusWidget"] {
+    display: none !important;
+    visibility: hidden !important;
+}
+
+/* Share */
+header button[title="Share"],
+header button[aria-label="Share"],
+header button[title*="share" i],
+header button[aria-label*="share" i] {
+    display: none !important;
+}
+
+/* Etoile / favori */
+header button[title*="favorite" i],
+header button[aria-label*="favorite" i],
+header button[title*="favourite" i],
+header button[aria-label*="favourite" i],
+header button[title*="star" i],
+header button[aria-label*="star" i] {
+    display: none !important;
+}
+
+/* Edit */
+header button[title="Edit"],
+header button[aria-label="Edit"],
+header button[title*="edit" i],
+header button[aria-label*="edit" i] {
+    display: none !important;
+}
+
+/* GitHub */
+header a[href*="github.com"],
+header a[title*="github" i],
+header a[aria-label*="github" i],
+header button[title*="github" i],
+header button[aria-label*="github" i] {
+    display: none !important;
+}
+
+/* Menu trois points */
+header [data-testid="stMainMenu"] {
+    display: none !important;
+}
+.block-container{max-width:1520px;padding-top:1rem;padding-bottom:2rem}
+section[data-testid="stSidebar"],section[data-testid="stSidebar"]>div{background:#FFF!important;border-right:1px solid var(--line)}
+h1,h2,h3,h4,h5,h6,p,label,span,div{color:var(--ink)}
+[data-testid="stCaptionContainer"],.stCaption{color:var(--muted)!important}
+.brand{display:flex;align-items:center;gap:.75rem;margin:.2rem 0 1rem}.brandmark{width:44px;height:44px;border-radius:13px;background:linear-gradient(145deg,#123B67,#155EEF);color:#fff!important;display:flex;align-items:center;justify-content:center;font-weight:950;font-size:1.4rem;box-shadow:0 8px 20px rgba(21,94,239,.2)}.brandname{font-weight:950;font-size:1.05rem;letter-spacing:.06em}.brandsub{font-size:.72rem;color:var(--muted)!important}
+.topbar{display:flex;justify-content:space-between;align-items:center;margin:.2rem 0 1rem}.title{font-size:1.55rem;font-weight:950;letter-spacing:-.025em}.subtitle{font-size:.86rem;color:var(--muted)!important;margin-top:.15rem}.weekbadge{background:#EEF4FF;color:#155EEF!important;border:1px solid #C7D7FE;padding:.42rem .72rem;border-radius:999px;font-weight:850;font-size:.78rem}
+.hero{background:linear-gradient(135deg,#123B67 0%,#155EEF 100%);border-radius:20px;padding:1.3rem 1.45rem;margin-bottom:1rem;box-shadow:0 12px 30px rgba(21,94,239,.12)}.hero *{color:#fff!important}.hero-title{font-weight:950;font-size:1.28rem}.hero-sub{opacity:.9;font-size:.89rem;margin-top:.35rem;max-width:1050px}
+.card{background:#FFF;border:1px solid var(--line);border-radius:16px;padding:1rem 1.1rem;box-shadow:0 1px 3px rgba(16,24,40,.035)}
+.kpi{background:#FFF;border:1px solid var(--line);border-radius:15px;padding:.86rem 1rem;min-height:98px}.kpi-l{font-size:.70rem;font-weight:850;color:var(--muted)!important;text-transform:uppercase;letter-spacing:.05em}.kpi-v{font-size:1.42rem;font-weight:950;margin-top:.25rem}.kpi-s{font-size:.72rem;color:var(--muted)!important;margin-top:.15rem}
+.status-ok{display:inline-flex;align-items:center;gap:.35rem;color:#067647!important;background:#ECFDF3;border:1px solid #ABEFC6;padding:.34rem .58rem;border-radius:999px;font-size:.75rem;font-weight:850}.status-warn{display:inline-flex;align-items:center;gap:.35rem;color:#B54708!important;background:#FFFAEB;border:1px solid #FEDF89;padding:.34rem .58rem;border-radius:999px;font-size:.75rem;font-weight:850}.status-err{display:inline-flex;align-items:center;gap:.35rem;color:#B42318!important;background:#FEF3F2;border:1px solid #FECDCA;padding:.34rem .58rem;border-radius:999px;font-size:.75rem;font-weight:850}
+.agent{background:#FFF;border:1px solid var(--line);border-radius:12px;padding:.68rem .8rem;margin:.35rem 0}.agent-ok{border-left:4px solid #12B76A}.agent-warn{border-left:4px solid #F79009}.agent b{font-size:.83rem}.agent small{color:var(--muted)!important}
+[data-testid="stMetric"]{background:#FFF;border:1px solid var(--line);border-radius:14px;padding:.72rem .9rem}.stButton>button{border-radius:10px;font-weight:800;border:1px solid #D5DCE6;min-height:42px}.stButton>button[kind="primary"]{background:#155EEF;border-color:#155EEF;color:#fff!important}.stButton>button[kind="primary"] *{color:#fff!important}
+[data-testid="stDataFrame"],[data-testid="stDataEditor"]{background:#FFF;border:1px solid var(--line);border-radius:14px;overflow:hidden}button[data-baseweb="tab"]{font-weight:800}button[data-baseweb="tab"][aria-selected="true"]{color:#155EEF!important}.stDownloadButton button{border-radius:10px;font-weight:850}
+@media(max-width:900px){.block-container{padding-left:.75rem;padding-right:.75rem}.topbar{align-items:flex-start;flex-direction:column;gap:.55rem}.hero{padding:1rem}}
 </style>
 """
 
@@ -1598,11 +1529,11 @@ def _brand() -> None:
 
 
 def _top(title: str, subtitle: str, cfg: PlannerConfig) -> None:
-    st.markdown(f"<div class='topbar'><div><div class='title'>{_esc(title)}</div><div class='subtitle'>{_esc(subtitle)}</div></div><div class='weekbadge'>S{cfg.week} · {cfg.year}</div></div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='topbar'><div><div class='title'>{title}</div><div class='subtitle'>{subtitle}</div></div><div class='weekbadge'>S{cfg.week} · {cfg.year}</div></div>", unsafe_allow_html=True)
 
 
 def _kpi(label: str, value: str, sub: str = "") -> None:
-    st.markdown(f"<div class='kpi'><div class='kpi-l'>{_esc(label)}</div><div class='kpi-v'>{_esc(value)}</div><div class='kpi-s'>{_esc(sub)}</div></div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='kpi'><div class='kpi-l'>{label}</div><div class='kpi-v'>{value}</div><div class='kpi-s'>{sub}</div></div>", unsafe_allow_html=True)
 
 
 def _parse_commands(text: str) -> Tuple[str, ...]:
@@ -1700,398 +1631,42 @@ def render_planning(result: Dict[str, Any], cfg: PlannerConfig) -> None:
     )
 
 
-
-if st is not None:
-    @st.cache_resource(show_spinner=False)
-    def _shared_plan_registry() -> Dict[str, Any]:
-        return {}
-else:
-    def _shared_plan_registry() -> Dict[str, Any]:
-        return {}
-
-
-def _admin_gate() -> bool:
-    if st.session_state.get("admin_authenticated", False):
-        return True
-
-    cfg = PlannerConfig(DEFAULT_YEAR, DEFAULT_WEEK)
-    _top("Administration sécurisée", "Authentification requise pour modifier ou publier le planning.", cfg)
-    if not admin_auth_configured():
-        st.error("Mot de passe administrateur non configuré.")
-        st.info("Configurez ALLUCO_ADMIN_PASSWORD_HASH ou ALLUCO_ADMIN_PASSWORD dans les secrets du déploiement. Pour un usage local privé, LOCAL_ADMIN_PASSWORD peut être renseigné dans app.py.")
-        return False
-
-    now = time.time()
-    lock_until = float(st.session_state.get("admin_lock_until", 0.0))
-    if now < lock_until:
-        remaining = max(1, int(math.ceil(lock_until - now)))
-        st.error(f"Accès temporairement verrouillé. Réessayez dans {remaining} s.")
-        return False
-
-    with st.form("admin_login_form", clear_on_submit=True):
-        password = st.text_input("Mot de passe administrateur", type="password", autocomplete="current-password")
-        submit = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
-    if submit:
-        if verify_admin_password(password):
-            st.session_state["admin_authenticated"] = True
-            st.session_state["admin_failed_attempts"] = 0
-            st.session_state["admin_lock_until"] = 0.0
-            st.rerun()
-        attempts = int(st.session_state.get("admin_failed_attempts", 0)) + 1
-        if attempts >= AUTH_MAX_ATTEMPTS:
-            st.session_state["admin_failed_attempts"] = 0
-            st.session_state["admin_lock_until"] = time.time() + AUTH_LOCK_SECONDS
-            st.error("Trop de tentatives. Accès temporairement verrouillé.")
-        else:
-            st.session_state["admin_failed_attempts"] = attempts
-            st.error("Identifiants incorrects.")
-    return False
-
-
-def _public_plan_payload(result: Dict[str, Any], source_signature: str) -> Dict[str, Any]:
-    cfg: PlannerConfig = result["config"]
-    week_dates = iso_week_dates(cfg.year, cfg.week)
-    commands: Dict[str, Dict[str, Any]] = {}
-    for d in range(6):
-        df = result["days"].get(d)
-        if df is None or df.empty:
-            continue
-        for cmd, g in df.groupby("NumCommande", sort=False):
-            key = norm_text(cmd).upper()
-            entry = commands.setdefault(key, {"status": "PLANIFIÉ", "days": [], "colors": [], "hours": 0.0, "lines": 0})
-            entry["days"].append({"day": DAYS[d].title(), "date": week_dates[d].strftime("%d/%m/%Y")})
-            entry["colors"].extend(g["Couleur"].dropna().astype(str).str.upper().tolist())
-            entry["hours"] += float(pd.to_numeric(g["tps"], errors="coerce").fillna(0).sum())
-            entry["lines"] += int(len(g))
-    backlog = result.get("unscheduled", pd.DataFrame())
-    if backlog is not None and not backlog.empty and "NumCommande" in backlog.columns:
-        for cmd, g in backlog.groupby("NumCommande", sort=False):
-            key = norm_text(cmd).upper()
-            if key not in commands:
-                commands[key] = {
-                    "status": "BACKLOG", "days": [],
-                    "colors": list(dict.fromkeys(g.get("Couleur", pd.Series(dtype=str)).dropna().astype(str).str.upper().tolist())),
-                    "hours": float(pd.to_numeric(g.get("tps", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
-                    "lines": int(len(g)),
-                }
-    for entry in commands.values():
-        entry["colors"] = list(dict.fromkeys(entry["colors"]))
-        entry["hours"] = round(float(entry["hours"]), 2)
-    return {
-        "source_signature": source_signature,
-        "published_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
-        "year": int(cfg.year), "week": int(cfg.week),
-        "strategy": norm_text(result.get("selected_strategy", cfg.strategy)),
-        "confidence": int(result.get("confidence", 0)),
-        "commands": commands,
-    }
-
-
-def render_publish_controls(result: Dict[str, Any], source_signature: str) -> None:
-    registry = _shared_plan_registry()
-    st.markdown("#### Publication espace client")
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        if result.get("hard_errors"):
-            st.warning("Publication désactivée: le planning contient une erreur bloquante.")
-        elif st.button("Publier ce planning aux clients", type="primary", use_container_width=True):
-            registry["published"] = _public_plan_payload(result, source_signature)
-            st.success("Planning publié dans l'espace client pour la session serveur active.")
-    with c2:
-        if st.button("Retirer la publication", use_container_width=True):
-            registry.pop("published", None)
-            st.info("Publication client retirée.")
-    published = registry.get("published")
-    if published and published.get("source_signature") == source_signature:
-        st.caption(f"Publié: S{published['week']} · {published['year']} · {published['published_at']} · {published['strategy']}")
-
-
-def _client_order_rows(source: pd.DataFrame, command: str) -> pd.DataFrame:
-    key = norm_text(command).upper()
-    if not key or "NumCommande" not in source.columns:
-        return source.iloc[0:0].copy()
-    keys = source["NumCommande"].map(lambda x: norm_text(x).upper())
-    return source.loc[keys.eq(key)].copy()
-
-
-def _first_valid_date(rows: pd.DataFrame, columns: Sequence[str]) -> Optional[pd.Timestamp]:
-    values: List[pd.Timestamp] = []
-    for c in columns:
-        if c not in rows.columns:
-            continue
-        for value in rows[c].tolist():
-            dt = parse_date(value)
-            if dt is not None:
-                values.append(dt)
-        if values:
-            return min(values)
-    return None
-
-
-def _client_detail_table(rows: pd.DataFrame) -> pd.DataFrame:
-    data: List[Dict[str, Any]] = []
-    for i, (_, r) in enumerate(rows.iterrows(), 1):
-        article = norm_text(r.get("Article"))
-        article_internal, color = split_article(article)
-        ordered = max(0.0, to_float(r.get("QteCommandé")))
-        remaining = max(0.0, to_float(r.get("ResteALivrer")))
-        delivered = max(0.0, ordered - remaining)
-        progress = (delivered / ordered * 100.0) if ordered > 0 else 0.0
-        due = due_date_from_row(r)
-        data.append({
-            "Ligne": i,
-            "Article": article_internal or article,
-            "Couleur": color or "—",
-            "Commandé": int(round(ordered)),
-            "Livré estimé": int(round(delivered)),
-            "Reste à livrer": int(round(remaining)),
-            "Progression %": round(max(0.0, min(100.0, progress)), 1),
-            "N° OF": norm_text(r.get("NumOF")) or "—",
-            "Statut production": norm_text(r.get("ProdStatut")) or "—",
-            "Qté commencée": to_int(r.get("QteCommencé")),
-            "Qté reçue": to_int(r.get("QteRèçu")),
-            "Échéance": due.strftime("%d/%m/%Y") if due is not None else "—",
-        })
-    return pd.DataFrame(data)
-
-
-def _client_order_status(rows: pd.DataFrame, plan_entry: Optional[Dict[str, Any]]) -> str:
-    ordered = float(pd.to_numeric(rows.get("QteCommandé", pd.Series(dtype=float)), errors="coerce").fillna(0).clip(lower=0).sum())
-    remaining = float(pd.to_numeric(rows.get("ResteALivrer", pd.Series(dtype=float)), errors="coerce").fillna(0).clip(lower=0).sum())
-    if ordered > 0 and remaining <= 0:
-        return "LIVRÉE"
-    if plan_entry and plan_entry.get("status") == "PLANIFIÉ":
-        return "PLANIFIÉE"
-    prod = " ".join(rows.get("ProdStatut", pd.Series(dtype=str)).fillna("").astype(str).tolist()).lower()
-    if "commenc" in norm_key(prod):
-        return "EN PRODUCTION"
-    if plan_entry and plan_entry.get("status") == "BACKLOG":
-        return "EN ATTENTE DE PLANIFICATION"
-    return "EN COURS"
-
-
-def export_client_report_excel(command: str, rows: pd.DataFrame, plan_entry: Optional[Dict[str, Any]], published: Optional[Dict[str, Any]]) -> bytes:
-    detail = _client_detail_table(rows)
-    out = io.BytesIO()
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Rapport commande"
-    navy, blue, white = "163A5F", "155EEF", "FFFFFF"
-    ws["A1"] = f"ALLUCO — Rapport commande {command}"
-    ws["A1"].font = Font(size=16, bold=True, color=white)
-    ws["A1"].fill = PatternFill("solid", fgColor=navy)
-    ws.merge_cells("A1:D1")
-    ordered = int(pd.to_numeric(rows.get("QteCommandé", pd.Series(dtype=float)), errors="coerce").fillna(0).clip(lower=0).sum())
-    remaining = int(pd.to_numeric(rows.get("ResteALivrer", pd.Series(dtype=float)), errors="coerce").fillna(0).clip(lower=0).sum())
-    delivered = max(0, ordered - remaining)
-    client = " · ".join(dict.fromkeys(norm_text(x) for x in rows.get("NomClient", pd.Series(dtype=str)).tolist() if norm_text(x))) or "—"
-    summary = [
-        ("Commande", command), ("Client", client), ("Quantité commandée", ordered),
-        ("Livré estimé", delivered), ("Reste à livrer", remaining),
-        ("Statut planning", plan_entry.get("status") if plan_entry else "Non publié"),
-    ]
-    if published:
-        summary.append(("Planning publié", f"S{published.get('week')} / {published.get('year')} · {published.get('published_at')}"))
-    for ri, (k, v) in enumerate(summary, start=3):
-        ws.cell(ri, 1, k).font = Font(bold=True, color=navy)
-        ws.cell(ri, 2, v)
-    start = 11
-    for ci, col in enumerate(detail.columns, 1):
-        cell = ws.cell(start, ci, col)
-        cell.fill = PatternFill("solid", fgColor=blue)
-        cell.font = Font(color=white, bold=True)
-    for ri, (_, r) in enumerate(detail.iterrows(), start=start + 1):
-        for ci, col in enumerate(detail.columns, 1):
-            ws.cell(ri, ci, r.get(col))
-    for ci in range(1, max(4, len(detail.columns)) + 1):
-        ws.column_dimensions[get_column_letter(ci)].width = 18
-    wb.save(out)
-    return out.getvalue()
-
-
-def render_client_portal(source: pd.DataFrame, cfg: PlannerConfig, source_signature: str) -> None:
-    _top("Suivi de commande", "Rapport client sécurisé, clair et actualisé depuis la base de production.", cfg)
-    st.markdown("<div class='hero'><div class='hero-title'>Consulter une commande</div><div class='hero-sub'>Saisissez le numéro exact de commande pour afficher son avancement, ses quantités, ses échéances et sa position dans le dernier planning publié.</div></div>", unsafe_allow_html=True)
-
-    access_required = bool(client_access_code())
-    with st.form("client_lookup_form", clear_on_submit=False):
-        command_input = st.text_input("Numéro de commande", placeholder="Ex. VTE2601234", max_chars=40)
-        access_input = st.text_input("Code d'accès", type="password", max_chars=80) if access_required else ""
-        submitted = st.form_submit_button("Afficher le rapport", type="primary", use_container_width=True)
-
-    if submitted:
-        if not _client_query_allowed():
-            st.error("Trop de consultations rapprochées. Réessayez dans quelques instants.")
-            return
-        command = norm_text(command_input).upper()
-        valid_format = bool(re.fullmatch(r"[A-Z0-9][A-Z0-9._/\- ]{1,39}", command))
-        access_ok = (not access_required) or hmac.compare_digest(access_input, client_access_code())
-        rows = _client_order_rows(source, command) if valid_format and access_ok else source.iloc[0:0].copy()
-        if rows.empty:
-            st.warning("Commande introuvable ou accès invalide.")
-            return
-        st.session_state["client_last_command"] = command
-    else:
-        command = norm_text(st.session_state.get("client_last_command", "")).upper()
-        if not command:
-            st.caption("La recherche est exacte afin d'éviter les correspondances ambiguës.")
-            return
-        rows = _client_order_rows(source, command)
-        if rows.empty:
-            return
-
-    detail = _client_detail_table(rows)
-    published = _shared_plan_registry().get("published")
-    if published and published.get("source_signature") != source_signature:
-        published = None
-    plan_entry = published.get("commands", {}).get(command) if published else None
-
-    ordered = float(detail["Commandé"].sum()) if not detail.empty else 0.0
-    delivered = float(detail["Livré estimé"].sum()) if not detail.empty else 0.0
-    remaining = float(detail["Reste à livrer"].sum()) if not detail.empty else 0.0
-    progress = max(0.0, min(100.0, (delivered / ordered * 100.0) if ordered > 0 else 0.0))
-    clients = [norm_text(x) for x in rows.get("NomClient", pd.Series(dtype=str)).tolist() if norm_text(x)]
-    client_name = " · ".join(dict.fromkeys(clients)) or "—"
-    created = _first_valid_date(rows, ["DateCréation"])
-    due = _first_valid_date(rows, ["DateLivraisonConfirmé", "DateExpeditionConfirmé", "DateExpeditionDemandé"])
-    status = _client_order_status(rows, plan_entry)
-
-    st.markdown(
-        f"<div class='client-card'><div class='client-head'><div><div class='client-order'>{_esc(command)}</div><div class='client-meta'>{_esc(client_name)}</div></div><span class='status-ok'>{_esc(status)}</span></div><div class='progress-wrap'><div class='progress-bar' style='width:{progress:.2f}%'></div></div><div class='client-meta'>{progress:.1f}% livré estimé · {int(round(remaining))} restant</div></div>",
-        unsafe_allow_html=True,
-    )
-    st.write("")
-    cols = st.columns(6)
-    values = [
-        ("Commandé", format_num(ordered), "unités"),
-        ("Livré estimé", format_num(delivered), f"{progress:.0f}%"),
-        ("Reste", format_num(remaining), "à livrer"),
-        ("Lignes", str(len(detail)), "articles"),
-        ("Création", created.strftime("%d/%m/%Y") if created is not None else "—", "commande"),
-        ("Échéance", due.strftime("%d/%m/%Y") if due is not None else "—", "prioritaire"),
-    ]
-    for col, val in zip(cols, values):
-        with col:
-            _kpi(*val)
-
-    st.write("")
-    left, right = st.columns([3, 2])
-    with left:
-        st.markdown("#### Quantités par ligne")
-        chart = detail[["Ligne", "Commandé", "Livré estimé", "Reste à livrer"]].set_index("Ligne")
-        st.bar_chart(chart, use_container_width=True)
-        st.markdown("#### Courbe cumulée")
-        curve = detail[["Ligne", "Commandé", "Livré estimé", "Reste à livrer"]].copy()
-        curve["Commandé cumulé"] = curve["Commandé"].cumsum()
-        curve["Livré cumulé"] = curve["Livré estimé"].cumsum()
-        curve["Reste cumulé"] = curve["Reste à livrer"].cumsum()
-        st.line_chart(curve.set_index("Ligne")[["Commandé cumulé", "Livré cumulé", "Reste cumulé"]], use_container_width=True)
-    with right:
-        st.markdown("#### Planning publié")
-        if plan_entry and plan_entry.get("status") == "PLANIFIÉ":
-            days = " · ".join(f"{x['day']} {x['date']}" for x in plan_entry.get("days", [])) or "—"
-            colors = " → ".join(plan_entry.get("colors", [])) or "—"
-            st.success("Commande présente dans le planning publié.")
-            st.write(f"**Jour(s)** : {days}")
-            st.write(f"**Couleur(s)** : {colors}")
-            st.write(f"**Charge estimée** : {float(plan_entry.get('hours', 0)):.2f} h")
-        elif plan_entry and plan_entry.get("status") == "BACKLOG":
-            st.warning("Commande présente dans le backlog du planning publié.")
-            colors = " → ".join(plan_entry.get("colors", [])) or "—"
-            st.write(f"**Couleur(s)** : {colors}")
-        else:
-            st.info("Aucun planning client publié pour cette commande.")
-        if published:
-            st.caption(f"Publication: S{published['week']} · {published['year']} · {published['published_at']} · {published['strategy']}")
-
-    st.markdown("#### Détail de la commande")
-    st.dataframe(detail, hide_index=True, use_container_width=True, height=min(520, 84 + len(detail) * 35))
-
-    report_bytes = export_client_report_excel(command, rows, plan_entry, published)
-    st.download_button(
-        "Télécharger le rapport Excel",
-        data=report_bytes,
-        file_name=f"Rapport_Commande_{re.sub(r'[^A-Z0-9_-]+', '_', command)}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-
-
 def render_ui() -> None:
     if st is None:
         raise RuntimeError("Streamlit n'est pas installé. Lancez: pip install -r requirements.txt")
 
-    st.set_page_config(page_title=APP_NAME, page_icon="A", layout="wide", initial_sidebar_state="expanded")
-    dark_mode = bool(st.session_state.get("ui_dark_mode", False))
-    st.markdown(build_css(dark_mode), unsafe_allow_html=True)
-
-    today = date.today().isocalendar()
-    public_cfg = PlannerConfig(
-        year=int(DEFAULT_YEAR or today.year),
-        week=int(DEFAULT_WEEK or today.week),
-        strategy="Auto — meilleur compromis",
-    )
-
-    with st.sidebar:
-        _brand()
-        portal = st.radio(
-            "Portail",
-            ["👤 Espace client", "🔐 Administration"],
-            label_visibility="collapsed",
-        )
-        st.toggle("Mode sombre", key="ui_dark_mode")
-        st.divider()
-        st.caption(f"Version {VERSION}")
+    st.set_page_config(page_title=APP_NAME, page_icon="🤖", layout="wide", initial_sidebar_state="expanded")
+    st.markdown(CSS, unsafe_allow_html=True)
 
     if not SOURCE_PATH.exists():
-        _top("Source indisponible", "Le service ne peut pas consulter les commandes.", public_cfg)
-        st.error("Source de données indisponible. Contactez l'administrateur.")
+        cfg = PlannerConfig(DEFAULT_YEAR, DEFAULT_WEEK)
+        _top("Fichier source absent", "Le planning ne peut pas être calculé.", cfg)
+        st.error(f"Ajoutez `{SOURCE_FILENAME}` à côté de `app.py` dans GitHub.")
         return
 
-    try:
-        source = _cached_source(str(SOURCE_PATH), SOURCE_PATH.stat().st_mtime_ns, SOURCE_PATH.stat().st_size)
-        file_signature = source_file_signature(SOURCE_PATH)
-    except Exception as exc:
-        ref = safe_error_id(exc)
-        _top("Service indisponible", "La lecture de la source a été interrompue.", public_cfg)
-        st.error(f"Impossible de charger les données. Référence: {ref}")
-        return
-
-    if portal == "👤 Espace client":
-        render_client_portal(source, public_cfg, file_signature)
-        return
-
-    if not _admin_gate():
-        return
-
+    today = date.today().isocalendar()
     with st.sidebar:
-        if st.button("Se déconnecter", use_container_width=True):
-            st.session_state["admin_authenticated"] = False
-            st.session_state.pop("plan_result", None)
-            st.session_state.pop("plan_signature", None)
-            st.rerun()
+        _brand()
+        nav = st.radio("Navigation", ["🤖 Planning IA", "🏠 Tableau de bord", "🧠 Analyse IA", "⚙️ Paramètres"], label_visibility="collapsed")
         st.divider()
-        nav = st.radio(
-            "Navigation admin",
-            ["🤖 Planning IA", "🏠 Tableau de bord", "🧠 Analyse IA", "⚙️ Paramètres"],
-            label_visibility="collapsed",
-        )
-        st.divider()
-        with st.form("admin_planner_settings"):
-            year = int(st.number_input("Année", 2024, 2035, DEFAULT_YEAR or int(today.year), 1))
-            week = int(st.number_input("Semaine", 1, 53, DEFAULT_WEEK or int(today.week), 1))
-            objective = st.selectbox("Objectif", ["Auto — meilleur compromis", "Délais clients", "Mono-couleur", "Équilibre"])
+        year = int(st.number_input("Année", 2024, 2035, DEFAULT_YEAR or int(today.year), 1))
+        week = int(st.number_input("Semaine", 1, 53, DEFAULT_WEEK or int(today.week), 1))
+        objective = st.selectbox("Objectif", ["Auto — meilleur compromis", "Délais clients", "Mono-couleur", "Équilibre"])
+        with st.expander("Réglages production"):
             cap = float(st.number_input("Capacité Lun–Ven (h)", 1.0, 24.0, DEFAULT_CAPACITY_H, 0.5))
             sat = st.checkbox("Production samedi", value=DEFAULT_SATURDAY_ENABLED)
             sat_cap = float(st.number_input("Capacité samedi (h)", 0.0, 24.0, DEFAULT_SATURDAY_CAPACITY_H, 0.5, disabled=not sat))
-            cleaning = int(st.number_input("Nettoyage 2e couleur (min)", 0, 120, DEFAULT_CLEANING_MIN, 5))
+            cleaning = int(st.number_input("Nettoyage si 2e couleur (min)", 0, 120, DEFAULT_CLEANING_MIN, 5))
             solver = float(st.slider("Budget optimisation IA (s)", 6, 60, int(DEFAULT_SOLVER_SECONDS), 3))
-            force_text = st.text_area("Forcer commandes", placeholder="VTE2601234, VTE2605678")
+            st.info("Règle fixe: 1 couleur/jour privilégiée, 2 maximum.")
+        with st.expander("Contraintes manuelles"):
+            force_text = st.text_area("Forcer commandes cette semaine", placeholder="VTE2601234, VTE2605678")
             exclude_text = st.text_area("Exclure commandes", placeholder="VTE2609999")
-            settings_submit = st.form_submit_button("Appliquer les réglages", use_container_width=True)
-        st.markdown("<span class='status-ok'>● Source production connectée</span>", unsafe_allow_html=True)
+        st.divider()
+        st.markdown("<span class='status-ok'>● Base GitHub connectée</span>", unsafe_allow_html=True)
         st.caption(SOURCE_FILENAME)
         st.caption("OR-Tools: " + ("actif" if ORTOOLS_AVAILABLE else "fallback local"))
+        st.caption(f"Version {VERSION}")
 
     cfg = PlannerConfig(
         year=year, week=week, capacity_h=cap,
@@ -2103,71 +1678,62 @@ def render_ui() -> None:
         force_commands=_parse_commands(force_text), exclude_commands=_parse_commands(exclude_text),
     )
 
+    try:
+        source = _cached_source(str(SOURCE_PATH), SOURCE_PATH.stat().st_mtime_ns, SOURCE_PATH.stat().st_size)
+    except Exception as exc:
+        _top("Erreur de lecture", "Le moteur a arrêté le calcul pour protéger le planning.", cfg)
+        st.exception(exc)
+        return
+
     signature = _source_signature(SOURCE_PATH, cfg)
 
     def ensure_plan(force: bool = False):
         if force or st.session_state.get("plan_signature") != signature or "plan_result" not in st.session_state:
-            with st.spinner("Agents IA: données → priorités → scénarios → optimisation → réparation → validation..."):
+            with st.spinner("Agents IA: données → priorités → scénarios → optimisation → mono-couleur → réparation → validation..."):
                 st.session_state["plan_result"] = generate_agentic_plan(source, cfg)
                 st.session_state["plan_signature"] = signature
         return st.session_state.get("plan_result")
 
-    if settings_submit:
-        st.session_state.pop("plan_result", None)
-        st.session_state.pop("plan_signature", None)
-
     if nav == "🤖 Planning IA":
-        _top("Planning IA", "Optimisation, contrôle et publication du planning de production.", cfg)
+        _top("Planning IA", "Le fichier est lu depuis GitHub. Aucun upload manuel.", cfg)
         c1, c2, c3 = st.columns([2, 1, 1])
         with c1:
-            st.markdown(f"<div class='card'><b>Source production</b><br><span class='subtitle'>{_esc(SOURCE_FILENAME)}</span><br><span class='subtitle'>{format_num(len(source))} lignes détectées</span></div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='card'><b>Source production</b><br><span class='subtitle'>{SOURCE_FILENAME}</span><br><span class='subtitle'>{format_num(len(source))} lignes détectées</span></div>", unsafe_allow_html=True)
         with c2:
-            regenerate = st.button("Régénérer", use_container_width=True)
+            if st.button("↻ Régénérer", use_container_width=True):
+                ensure_plan(force=True)
         with c3:
             st.markdown("<div class='card'><b>Couleurs / jour</b><br><span class='subtitle'>1 privilégiée</span><br><span class='subtitle'>2 maximum</span></div>", unsafe_allow_html=True)
-        try:
-            result = ensure_plan(regenerate) if DEFAULT_AUTO_GENERATE else st.session_state.get("plan_result")
-        except Exception as exc:
-            ref = safe_error_id(exc)
-            st.error(f"Le planning n'a pas été généré. Référence: {ref}")
-            return
+
+        result = ensure_plan(False) if DEFAULT_AUTO_GENERATE else st.session_state.get("plan_result")
         if result:
             render_planning(result, cfg)
-            render_publish_controls(result, file_signature)
 
     elif nav == "🏠 Tableau de bord":
-        _top("Tableau de bord", "Vue opérationnelle des commandes, retards et capacité.", cfg)
+        _top("Tableau de bord", "Vue rapide des commandes et de la capacité de la semaine.", cfg)
         master = learn_source_master(source, cfg.powder_coeff, cfg.minutes_per_bal)
         lines, quality = build_candidate_lines(source, master, cfg)
         overdue = int((pd.to_numeric(lines.get("_overdue_days"), errors="coerce").fillna(0) > 0).sum()) if not lines.empty else 0
         unique_colors = int(lines["Couleur"].nunique()) if not lines.empty else 0
         cols = st.columns(5)
         vals = [
-            ("Commandes", format_num(source["NumCommande"].nunique()), "source"),
+            ("Commandes", format_num(source["NumCommande"].nunique()), "source GitHub"),
             ("Lignes éligibles", format_num(len(lines)), "à planifier"),
-            ("Retards", str(overdue), "début de semaine"),
-            ("Couleurs", str(unique_colors), "backlog"),
+            ("Retards", str(overdue), "au début de semaine"),
+            ("Couleurs", str(unique_colors), "backlog éligible"),
             ("Capacité", f"{sum(day_capacity_h(cfg,d) for d in range(6)):.0f} h", "semaine"),
         ]
         for col, val in zip(cols, vals):
             with col:
                 _kpi(*val)
-        try:
-            result = ensure_plan(False)
-        except Exception as exc:
-            st.error(f"Analyse indisponible. Référence: {safe_error_id(exc)}")
-            return
+        result = ensure_plan(False)
         if result:
             st.write("")
             render_planning(result, cfg)
 
     elif nav == "🧠 Analyse IA":
-        _top("Analyse IA", "Scénarios, décisions, réparations et backlog.", cfg)
-        try:
-            result = ensure_plan(False)
-        except Exception as exc:
-            st.error(f"Analyse indisponible. Référence: {safe_error_id(exc)}")
-            return
+        _top("Analyse IA", "Comparaison des stratégies, décisions des agents et backlog.", cfg)
+        result = ensure_plan(False)
         st.markdown("#### Comparaison des scénarios")
         st.dataframe(result["scenario_table"], hide_index=True, use_container_width=True)
         left, right = st.columns(2)
@@ -2175,7 +1741,7 @@ def render_ui() -> None:
             st.markdown("#### Rapport des agents")
             for agent, status, msg in result["steps"]:
                 cls = "agent agent-ok" if status == "OK" else "agent agent-warn"
-                st.markdown(f"<div class='{cls}'><b>{_esc(agent)} · {_esc(status)}</b><br><small>{_esc(msg)}</small></div>", unsafe_allow_html=True)
+                st.markdown(f"<div class='{cls}'><b>{agent} · {status}</b><br><small>{msg}</small></div>", unsafe_allow_html=True)
         with right:
             st.markdown("#### Réparations autonomes")
             if result["repair_log"]:
@@ -2201,7 +1767,7 @@ def render_ui() -> None:
             st.dataframe(expl.head(1500), hide_index=True, use_container_width=True, height=520)
 
     else:
-        _top("Paramètres", "Règles et état de sécurité du moteur.", cfg)
+        _top("Paramètres", "Règles transparentes utilisées par le moteur.", cfg)
         rules = pd.DataFrame([
             ["Fichier source", SOURCE_FILENAME],
             ["Historique planning", "Aucun fichier historique requis"],
@@ -2210,14 +1776,12 @@ def render_ui() -> None:
             ["Samedi", f"{'Actif' if cfg.saturday_enabled else 'Inactif'} · {cfg.saturday_capacity_h:.1f} h"],
             ["Cadence", f"{cfg.minutes_per_bal:.1f} min/bal"],
             ["Poudre", f"coefficient {cfg.powder_coeff:.3f}"],
-            ["Nettoyage", f"{cfg.cleaning_min} min si 2 couleurs"],
+            ["Nettoyage", f"{cfg.cleaning_min} min uniquement lorsqu'un jour contient 2 couleurs"],
             ["Optimisation", "3 scénarios + CP-SAT OR-Tools + réparation agentique"],
-            ["Admin", "Mot de passe configuré" if admin_auth_configured() else "NON CONFIGURÉ"],
-            ["Portail client", "Code d'accès actif" if client_access_code() else "Accès par numéro de commande"],
-            ["Confiance 100%", "Toutes les règles du moteur validées; ce n'est pas une garantie terrain"],
+            ["Confiance 100%", "Toutes les règles du moteur validées; ce n'est pas une garantie de données terrain"],
         ], columns=["Paramètre", "Valeur"])
         st.dataframe(rules, hide_index=True, use_container_width=True)
-        st.info("Le planning client n'est visible qu'après publication par un administrateur. La publication est conservée en mémoire du serveur et disparaît après un redémarrage; utilisez une base persistante si vous avez besoin d'une publication durable.")
+        st.info("Pour mettre à jour les commandes, remplacez Bd-Client-S36.xlsx dans GitHub puis redeployez. L'utilisateur n'importe aucun fichier dans l'application.")
 
 
 # =============================================================================
@@ -2272,14 +1836,7 @@ def self_test(source_path: Optional[str] = None) -> None:
 
 
 if __name__ == "__main__":
-    if "--hash-password" in sys.argv:
-        import getpass
-        pwd = getpass.getpass("Mot de passe administrateur: ")
-        confirm = getpass.getpass("Confirmer: ")
-        if pwd != confirm:
-            raise SystemExit("Les mots de passe ne correspondent pas.")
-        print(make_password_hash(pwd))
-    elif "--self-test" in sys.argv:
+    if "--self-test" in sys.argv:
         src = sys.argv[sys.argv.index("--input") + 1] if "--input" in sys.argv else None
         self_test(src)
     elif "--generate" in sys.argv:
