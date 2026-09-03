@@ -43,6 +43,11 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # Python ancien / base de fuseaux indisponible
+    ZoneInfo = None
+
 import numpy as np
 import pandas as pd
 from openpyxl import Workbook, load_workbook
@@ -85,9 +90,9 @@ APP_NAME = "ALLUCO — Planning Laquage IA"
 APP_SUBTITLE = "Agentic AI · Planning industriel · Portail Client"
 ROOT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT_DIR / "config.toml"
-LOGO_PATH = ROOT_DIR / "logo.png"
-# Conservé comme repère de packaging historique; la priorité runtime reste logo.png.
-LEGACY_LOGO_PATH = ROOT_DIR / "Alluco.png"
+LOGO_PATH = ROOT_DIR / "Alluco.png"
+# Compatibilité historique: ancien nom de fichier encore accepté en secours.
+LEGACY_LOGO_PATH = ROOT_DIR / "logo.png"
 EMBEDDED_LOGO_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAFFElEQVR4nO2c3VPUZRTHvwvL8rq4LKAUkgQGsygIiwIubxLMQoBOKgn4B3TfXRfe9Ac0003TTLd10wwmyFiSbWSO8iKTYVCIE5ZoiopSpgQKvy4YZqIBfmd3n/2dp/F87tg9z3MOfHhef7C2tLLjBgQ2orgLeNERAcyIAGZEADMigBkRwIwIYEYEMCMCmBEBzIgAZkQAMyKAGRHAjAhgRgQwIwKYEQHMiABmRAAzIoAZEcCMCGBGBDAjApgRAcyIAGZEADMigBkRwIwIYEYEMCMCmLFzF0Ch0utB90cngmpjGAZKD7+D6Tv3I1SVGv4XI6CjpSboNjabDR0t1RGoRi3aC0iIj8XB+rKQ2rY3V8NmsymuSC3aCzhYV4bE+LiQ2u7I3IqK4nzFFalFewEdrcFPP2vahzB9WYnWArZnpKLS6wmrj0P15YiPcyiqSD1aC2hvqQl7Dk9KiENrXWhriBXoLaBZzS5G52lIWwFle/Lw6vZtSvqqKi1A5rZUJX2pRlsBncTf2qfzC6YxUVE2HFM0mlSjpYC4WAcO1ZeTYk988AkpTtdDmZYCWg7sRXJSgmnclZ+m8GnPt7g9M2sam5OVgX1FeSrKU4qWAtqJ08/JvoswDAOnzg2Q4nUcBdoJeCk9BbX7dpvGLS0v49S5QQBA19mLpL7fbKhArCMmrPpUo52AY83ViIoy3/tfGBnHvdk5AMD49ZuYmLpl2iY5KQHNtXvDLVEp2gmg7v1P9l3a9OuN6AzzakM1Wgko3bUTr2W/bBq3sPgMZ/ovr3mNKqC2rBAZaSkh1RcJtBLQTlwk+y58j8dP5te8Nn3nPi5fnTRtu3ImqAqpvkigjQCHIwaH/ftJsRstutRRQBVtBdoIaKr2wuVMNI2be/wEgYHRdd/rDgzh+dKSaR952Znw7soNusZIoI0A6uLYGxjG4rPn6743++hPnB8aI/Wj6qIvXLQQkO7eggPlhaTYrr7N9/xm769ypNEHhwZnAi0EvPVGJezR0aZxv997iIErE5vGfHF+BPN/L5r25XImoqnaS64xUmghgHpf//lXl2AYm3/O7NP5BXz53QgxL/80xC6gKD8bntwsUiz1yoG6G6qrKMLWVBcpNlKwC6Auvtdu3Mb49Zuk2P7Bq3j4x1+mcfboaLQ1+Uh9Rgob52dHx9ijMXbmQ7hdTq4S8PMv06g5/i5bftYR4K8qYf3hA4AnNwtF+dls+VkFUO/9Iw3nBR2bALfLiQZfMVf6NRzx+xBjN98GRwI2AW2NlWzf9H9xu5zwV5Ww5GYToMMe/N9wTYcsAjy5WShkXPjWo8FXjNSUZMvzsgjQ7akUsLIlPuq3/kxg+X/IrBx+Kkmxw6OTaHn7vbBzDnW9j5ysDNO4ztYafPzZ2bDzBYPlI+D1/UVId28hxXYHBpXkPB0YIsXtztuBgp2vKMlJxXIB1Is3wzDQGxhWkrOHKACwfnq0VIDLmYhG4nZvaHQSdx88UpJ3bPI3TE3fJcW2NdGuxlVhqYBgHoL0fK1m+lnl9De00ZSWkox63x6luTfDUgHU6Wd52UBvv5rpZxXqOgBYe0axTEBediZKCnJIsYM/TGDmwZzS/D9e+xU3bs2QYv1VXqQkJynNvxGWCQjmT0GCWTSDgToKHDF2HG205kzA+jxA0OCJ2IuOCGBGBDAjApgRAcyIAGZEADMigBkRwIwIYEYEMCMCmBEBzIgAZkQAMyKAGRHAjAhgRgQw8w/6og9yf5DZpAAAAABJRU5ErkJggg=="
 
 DAYS = ["LUNDI", "MARDI", "MERCREDI", "JEUDI", "VENDREDI", "SAMEDI"]
@@ -134,6 +139,7 @@ APP_CONFIG = _load_toml()
 DATA_CFG = APP_CONFIG.get("data", {})
 PLAN_CFG = APP_CONFIG.get("planning", {})
 UI_CFG = APP_CONFIG.get("ui", {})
+APP_TIMEZONE = str(UI_CFG.get("timezone", "Africa/Tunis"))
 
 SOURCE_FILENAME = str(DATA_CFG.get("source_file", "Bd-Client-S36.xlsx"))
 SOURCE_PATH = ROOT_DIR / SOURCE_FILENAME
@@ -155,9 +161,11 @@ DEFAULT_POOL_FACTOR = float(PLAN_CFG.get("pool_factor", 2.7))
 PREFERRED_COLORS_PER_DAY = 1
 HARD_MAX_COLORS_PER_DAY = 2
 
-# Sécurité / portail. Laisser les valeurs locales vides en production et utiliser
-# ALLUCO_ADMIN_PASSWORD[_HASH] / ALLUCO_CLIENT_ACCESS_CODE via secrets ou variables d’environnement.
-LOCAL_ADMIN_PASSWORD = ""
+# Sécurité / portail. Les valeurs locales ci-dessous répondent au besoin demandé.
+# En production, elles peuvent être remplacées par ALLUCO_ADMIN_USERNAME,
+# ALLUCO_ADMIN_PASSWORD[_HASH] et ALLUCO_CLIENT_ACCESS_CODE via secrets/env.
+LOCAL_ADMIN_USERNAME = "Mahdi"
+LOCAL_ADMIN_PASSWORD = "Mahdi123++"
 LOCAL_CLIENT_ACCESS_CODE = ""
 PBKDF2_ITERATIONS = 310_000
 AUTH_MAX_ATTEMPTS = 5
@@ -223,6 +231,28 @@ def iso_week_dates(year: int, week: int) -> Dict[int, date]:
     return {i: monday + timedelta(days=i) for i in range(6)}
 
 
+def app_today() -> date:
+    """Date locale utilisée par l'application (Africa/Tunis par défaut)."""
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(APP_TIMEZONE)).date()
+        except Exception:
+            pass
+    return date.today()
+
+
+def automatic_planning_week(reference_date: Optional[date] = None) -> Tuple[int, int]:
+    """Retourne (année ISO, semaine ISO) selon la règle atelier.
+
+    - lundi à mercredi: semaine courante;
+    - jeudi à dimanche: semaine suivante.
+    """
+    ref = reference_date or app_today()
+    target = ref if ref.weekday() <= 2 else ref + timedelta(days=7)
+    iso = target.isocalendar()
+    return int(iso.year), int(iso.week)
+
+
 def _looks_like_color_token(token: str) -> bool:
     t = norm_text(token).upper()
     if not t or t == "BRUT":
@@ -266,20 +296,21 @@ def bytes_from_path(path: Path) -> bytes:
 
 
 def load_brand_logo(root_dir: Optional[Path] = None, embedded_base64: Optional[str] = None) -> Tuple[bytes, str]:
-    """Charge le logo de marque avec priorité stricte à ``logo.png``.
+    """Charge le logo ALLUCO avec priorité à ``Alluco.png``.
 
-    Ordre: ``<root>/logo.png`` -> Base64 embarqué. ``Alluco.png`` reste un asset
-    historique de packaging mais n'est volontairement pas prioritaire ici.
+    Ordre: ``<root>/Alluco.png`` -> ``<root>/logo.png`` (compatibilité)
+    -> Base64 embarqué.
     """
     root = Path(root_dir) if root_dir is not None else ROOT_DIR
-    external = root / "logo.png"
-    if external.is_file():
-        try:
-            data = external.read_bytes()
-            if data:
-                return data, "logo.png"
-        except OSError:
-            pass
+    for filename in ("Alluco.png", "logo.png"):
+        external = root / filename
+        if external.is_file():
+            try:
+                data = external.read_bytes()
+                if data:
+                    return data, filename
+            except OSError:
+                pass
 
     payload = EMBEDDED_LOGO_BASE64 if embedded_base64 is None else str(embedded_base64 or "")
     if payload:
@@ -360,11 +391,22 @@ def verify_admin_password(password: str) -> bool:
     return bool(plain) and hmac.compare_digest(str(password), str(plain))
 
 
+def admin_username() -> str:
+    return _runtime_secret("ALLUCO_ADMIN_USERNAME", LOCAL_ADMIN_USERNAME)
+
+
+def verify_admin_credentials(username: str, password: str) -> bool:
+    expected_user = admin_username()
+    user_ok = bool(expected_user) and hmac.compare_digest(str(username or ""), str(expected_user))
+    return user_ok and verify_admin_password(password)
+
+
 def admin_auth_configured() -> bool:
-    return bool(
+    password_configured = bool(
         _runtime_secret("ALLUCO_ADMIN_PASSWORD_HASH")
         or _runtime_secret("ALLUCO_ADMIN_PASSWORD", LOCAL_ADMIN_PASSWORD)
     )
+    return bool(admin_username()) and password_configured
 
 
 def client_access_code() -> str:
@@ -1752,9 +1794,9 @@ def build_css(dark: bool = False) -> str:
 <style>
 :root{{--bg:{theme['bg']};--card:{theme['card']};--surface:{theme['surface']};--ink:{theme['ink']};--muted:{theme['muted']};--line:{theme['line']};--blue:{theme['blue']};--navy:{theme['navy']};--green:{theme['green']};--amber:{theme['amber']};--red:{theme['red']};--input:{theme['input']};--softblue:{theme['softblue']}}}
 html,body,.stApp,[data-testid="stAppViewContainer"]{{background:var(--bg)!important;color:var(--ink)!important;color-scheme:{scheme}!important}}
-header[data-testid="stHeader"]{{background:color-mix(in srgb,var(--bg) 94%,transparent)!important;box-shadow:none!important}}
-#MainMenu,footer,[data-testid="stAppDeployButton"],[data-testid="stMainMenu"],[data-testid="stStatusWidget"]{{display:none!important;visibility:hidden!important}}
-header button[title="Share"],header button[aria-label="Share"],header a[aria-label*="GitHub"],header button[aria-label*="GitHub"],header button[title="Edit"]{{display:none!important}}
+header[data-testid="stHeader"]{{height:0!important;min-height:0!important;background:transparent!important;box-shadow:none!important;overflow:visible!important}}
+#MainMenu,footer,[data-testid="stAppDeployButton"],[data-testid="stMainMenu"],[data-testid="stStatusWidget"],[data-testid="stToolbar"],[data-testid="stToolbarActions"],[data-testid="stHeaderActionElements"],[data-testid="stDecoration"],[data-testid="manage-app-button"]{{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important}}
+header button[title="Share"],header button[aria-label="Share"],header a[aria-label*="GitHub"],header button[aria-label*="GitHub"],header button[title="Edit"],header button[aria-label="Edit"],header button[aria-label*="favorite" i],header button[title*="favorite" i],header button[aria-label*="star" i],header button[title*="star" i]{{display:none!important;visibility:hidden!important;opacity:0!important;pointer-events:none!important}}
 .block-container{{max-width:1520px;padding-top:1rem;padding-bottom:2rem}}
 section[data-testid="stSidebar"],section[data-testid="stSidebar"]>div{{background:var(--card)!important;border-right:1px solid var(--line)}}
 [data-testid="stSidebarCollapseButton"],[data-testid="stSidebarCollapsedControl"],button[aria-label="Collapse sidebar"],button[aria-label="Expand sidebar"],button[title="Collapse sidebar"],button[title="Expand sidebar"]{{display:flex!important;visibility:visible!important;opacity:1!important;pointer-events:auto!important;z-index:1000000!important}}
@@ -1762,7 +1804,7 @@ section[data-testid="stSidebar"],section[data-testid="stSidebar"]>div{{backgroun
 h1,h2,h3,h4,h5,h6,p,label,span,div{{color:var(--ink)}}
 [data-testid="stCaptionContainer"],.stCaption{{color:var(--muted)!important}}
 .brand{{display:flex;align-items:center;gap:.75rem;margin:.2rem 0 1rem}}.brandlogo{{width:118px;max-width:48%;height:52px;object-fit:contain;object-position:left center;display:block}}.brandmark{{width:44px;height:44px;border-radius:13px;background:linear-gradient(145deg,{theme['hero1']},{theme['hero2']});color:#fff!important;display:flex;align-items:center;justify-content:center;font-weight:950;font-size:1.4rem;box-shadow:0 8px 20px rgba(21,94,239,.18)}}.brandname{{font-weight:950;font-size:1.05rem;letter-spacing:.06em}}.brandsub{{font-size:.72rem;color:var(--muted)!important}}
-.topbar{{display:flex;justify-content:space-between;align-items:center;margin:.2rem 0 1rem}}.title{{font-size:1.55rem;font-weight:950;letter-spacing:-.025em}}.subtitle{{font-size:.86rem;color:var(--muted)!important;margin-top:.15rem}}.weekbadge{{background:var(--softblue);color:var(--blue)!important;border:1px solid var(--line);padding:.42rem .72rem;border-radius:999px;font-weight:850;font-size:.78rem}}
+.topbar{{display:flex;justify-content:space-between;align-items:center;gap:1rem;margin:.2rem 0 1rem}}.title{{font-size:1.55rem;font-weight:950;letter-spacing:-.025em}}.subtitle{{font-size:.86rem;color:var(--muted)!important;margin-top:.15rem}}.headbadges{{display:flex;align-items:center;justify-content:flex-end;gap:.45rem;flex-wrap:wrap}}.todaybadge,.weekbadge{{background:var(--softblue);color:var(--blue)!important;border:1px solid var(--line);padding:.42rem .72rem;border-radius:999px;font-weight:850;font-size:.78rem;white-space:nowrap}}.todaybadge{{background:var(--card);color:var(--muted)!important}}
 .hero{{background:linear-gradient(135deg,{theme['hero1']} 0%,{theme['hero2']} 100%);border-radius:20px;padding:1.3rem 1.45rem;margin-bottom:1rem;box-shadow:0 12px 30px rgba(21,94,239,.12)}}.hero *{{color:#fff!important}}.hero-title{{font-weight:950;font-size:1.28rem}}.hero-sub{{opacity:.92;font-size:.89rem;margin-top:.35rem;max-width:1050px}}
 .card,.client-card{{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:1rem 1.1rem;box-shadow:0 1px 3px rgba(16,24,40,.06)}}
 .kpi{{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:.86rem 1rem;min-height:98px}}.kpi-l{{font-size:.70rem;font-weight:850;color:var(--muted)!important;text-transform:uppercase;letter-spacing:.05em}}.kpi-v{{font-size:1.42rem;font-weight:950;margin-top:.25rem}}.kpi-s{{font-size:.72rem;color:var(--muted)!important;margin-top:.15rem}}
@@ -1783,7 +1825,15 @@ def _brand() -> None:
 
 
 def _top(title: str, subtitle: str, cfg: PlannerConfig) -> None:
-    st.markdown(f"<div class='topbar'><div><div class='title'>{_esc(title)}</div><div class='subtitle'>{_esc(subtitle)}</div></div><div class='weekbadge'>S{cfg.week} · {cfg.year}</div></div>", unsafe_allow_html=True)
+    today_value = app_today()
+    week_dates = iso_week_dates(cfg.year, cfg.week)
+    week_range = f"{week_dates[0].strftime('%d/%m')} → {week_dates[5].strftime('%d/%m')}"
+    st.markdown(
+        f"<div class='topbar'><div><div class='title'>{_esc(title)}</div><div class='subtitle'>{_esc(subtitle)}</div></div>"
+        f"<div class='headbadges'><div class='todaybadge'>Date du jour · {today_value.strftime('%d/%m/%Y')}</div>"
+        f"<div class='weekbadge'>S{cfg.week} · {cfg.year} · {week_range}</div></div></div>",
+        unsafe_allow_html=True,
+    )
 
 
 def _kpi(label: str, value: str, sub: str = "") -> None:
@@ -1921,11 +1971,12 @@ def _admin_gate() -> bool:
     if st.session_state.get("admin_authenticated", False):
         return True
 
-    cfg = PlannerConfig(DEFAULT_YEAR, DEFAULT_WEEK)
+    auto_year, auto_week = automatic_planning_week(app_today())
+    cfg = PlannerConfig(auto_year, auto_week)
     _top("Administration sécurisée", "Authentification requise pour modifier ou publier le planning.", cfg)
     if not admin_auth_configured():
         st.error("Mot de passe administrateur non configuré.")
-        st.info("Configurez ALLUCO_ADMIN_PASSWORD_HASH ou ALLUCO_ADMIN_PASSWORD dans les secrets du déploiement. Pour un usage local privé, LOCAL_ADMIN_PASSWORD peut être renseigné dans app.py.")
+        st.info("Configurez ALLUCO_ADMIN_USERNAME et ALLUCO_ADMIN_PASSWORD_HASH ou ALLUCO_ADMIN_PASSWORD dans les secrets du déploiement. Les valeurs locales restent disponibles pour un usage privé.")
         return False
 
     now = time.time()
@@ -1936,10 +1987,11 @@ def _admin_gate() -> bool:
         return False
 
     with st.form("admin_login_form", clear_on_submit=True):
-        password = st.text_input("Mot de passe administrateur", type="password", autocomplete="current-password")
+        username = st.text_input("Utilisateur", autocomplete="username", placeholder="Mahdi")
+        password = st.text_input("Mot de passe", type="password", autocomplete="current-password")
         submit = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
     if submit:
-        if verify_admin_password(password):
+        if verify_admin_credentials(username, password):
             st.session_state["admin_authenticated"] = True
             st.session_state["admin_failed_attempts"] = 0
             st.session_state["admin_lock_until"] = 0.0
@@ -2232,12 +2284,20 @@ def render_ui() -> None:
     dark_mode = bool(st.session_state.get("ui_dark_mode", False))
     st.markdown(build_css(dark_mode), unsafe_allow_html=True)
 
-    today = date.today().isocalendar()
+    today_date = app_today()
+    auto_year, auto_week = automatic_planning_week(today_date)
     public_cfg = PlannerConfig(
-        year=int(DEFAULT_YEAR or today.year),
-        week=int(DEFAULT_WEEK or today.week),
+        year=auto_year,
+        week=auto_week,
         strategy="Auto — meilleur compromis",
     )
+
+    # Réinitialise la semaine automatique une seule fois par nouveau jour.
+    auto_anchor = today_date.isoformat()
+    if st.session_state.get("planning_auto_anchor") != auto_anchor:
+        st.session_state["planning_year"] = auto_year
+        st.session_state["planning_week"] = auto_week
+        st.session_state["planning_auto_anchor"] = auto_anchor
 
     with st.sidebar:
         _brand()
@@ -2285,8 +2345,13 @@ def render_ui() -> None:
         )
         st.divider()
         with st.form("admin_planner_settings"):
-            year = int(st.number_input("Année", 2024, 2035, DEFAULT_YEAR or int(today.year), 1))
-            week = int(st.number_input("Semaine", 1, 53, DEFAULT_WEEK or int(today.week), 1))
+            year = int(st.number_input("Année", min_value=2024, max_value=2035, step=1, key="planning_year"))
+            week = int(st.number_input("Semaine", min_value=1, max_value=53, step=1, key="planning_week"))
+            auto_dates = iso_week_dates(auto_year, auto_week)
+            st.caption(
+                f"Semaine automatique du jour: S{auto_week} / {auto_year} · "
+                f"{auto_dates[0].strftime('%d/%m')} → {auto_dates[5].strftime('%d/%m')}"
+            )
             objective = st.selectbox("Objectif", ["Auto — meilleur compromis", "Délais clients", "Mono-couleur", "Équilibre"])
             cap = float(st.number_input("Capacité Lun–Ven (h)", 1.0, 24.0, DEFAULT_CAPACITY_H, 0.5))
             sat = st.checkbox("Production samedi", value=DEFAULT_SATURDAY_ENABLED)
@@ -2419,7 +2484,7 @@ def render_ui() -> None:
             ["Poudre", f"coefficient {cfg.powder_coeff:.3f}"],
             ["Nettoyage", f"{cfg.cleaning_min} min si 2 couleurs"],
             ["Optimisation", "3 scénarios + CP-SAT OR-Tools + réparation agentique"],
-            ["Admin", "Mot de passe configuré" if admin_auth_configured() else "NON CONFIGURÉ"],
+            ["Admin", f"Utilisateur {admin_username()} · accès configuré" if admin_auth_configured() else "NON CONFIGURÉ"],
             ["Portail client", "Code d'accès actif" if client_access_code() else "Accès par numéro de commande"],
             ["Confiance 100%", "Toutes les règles du moteur validées; ce n'est pas une garantie terrain"],
         ], columns=["Paramètre", "Valeur"])
@@ -2438,6 +2503,61 @@ def cli_generate(source_path: str, output_path: str, year: int, week: int) -> Di
     return result
 
 
+def modification_self_test() -> None:
+    """8 vérifications ciblées pour les modifications UI/auth/semaine/logo."""
+    checks: List[str] = []
+
+    def check(name: str, condition: bool, detail: Any = None) -> None:
+        if not condition:
+            raise AssertionError(f"{name}: {detail}")
+        checks.append(name)
+        print(f"[OK] {name}")
+
+    check("Lundi garde semaine courante", automatic_planning_week(date(2026, 8, 31)) == (2026, 36))
+    check("Mercredi garde semaine courante", automatic_planning_week(date(2026, 9, 2)) == (2026, 36))
+    check("Jeudi passe semaine suivante", automatic_planning_week(date(2026, 9, 3)) == (2026, 37))
+    check("Vendredi passe semaine suivante", automatic_planning_week(date(2026, 9, 4)) == (2026, 37))
+
+    d37 = iso_week_dates(2026, 37)
+    check("S37 du 07/09 au 12/09", d37[0] == date(2026, 9, 7) and d37[5] == date(2026, 9, 12), d37)
+
+    saved_env = {k: os.environ.get(k) for k in ("ALLUCO_ADMIN_USERNAME", "ALLUCO_ADMIN_PASSWORD", "ALLUCO_ADMIN_PASSWORD_HASH")}
+    try:
+        for key in saved_env:
+            os.environ.pop(key, None)
+        check(
+            "Authentification Admin Mahdi",
+            verify_admin_credentials("Mahdi", "Mahdi123++")
+            and not verify_admin_credentials("Mahdi", "mauvais")
+            and not verify_admin_credentials("Autre", "Mahdi123++"),
+        )
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    css = build_css(False)
+    check(
+        "Toolbar Share étoile Edit GitHub masquée",
+        '[data-testid="stToolbar"]' in css
+        and '[data-testid="stHeaderActionElements"]' in css
+        and 'title="Share"' in css
+        and 'GitHub' in css
+        and 'title="Edit"' in css
+        and 'favorite' in css,
+    )
+
+    embedded = base64.b64decode(EMBEDDED_LOGO_BASE64, validate=True)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        data, source = load_brand_logo(root)
+        check("Logo embarqué OK", source == "embedded-base64" and data == embedded and len(data) > 0)
+
+    print(f"\n{len(checks)}/8 tests internes OK")
+
+
 def self_test(source_path: Optional[str] = None) -> None:
     checks: List[str] = []
 
@@ -2454,7 +2574,7 @@ def self_test(source_path: Optional[str] = None) -> None:
 
     css = build_css(False)
     check("Sidebar refermable/réouvrable", "stSidebarCollapseButton" in css and "stSidebarCollapsedControl" in css and "pointer-events:auto" in css)
-    check("Contrôle sidebar non masqué par le header", '[data-testid="stHeaderActionElements"]{{display:none' not in css)
+    check("Toolbar Streamlit masquée", '[data-testid="stHeaderActionElements"]' in css and '[data-testid="stToolbar"]' in css)
 
     embedded = base64.b64decode(EMBEDDED_LOGO_BASE64, validate=True)
     with tempfile.TemporaryDirectory() as tmp:
@@ -2462,15 +2582,15 @@ def self_test(source_path: Optional[str] = None) -> None:
         data, source = load_brand_logo(root)
         check("Fallback logo Base64", source == "embedded-base64" and data == embedded)
 
-        external = b"external-logo-priority-test"
-        (root / "logo.png").write_bytes(external)
+        external = b"external-Alluco-logo-priority-test"
+        (root / "Alluco.png").write_bytes(external)
         data, source = load_brand_logo(root)
-        check("logo.png externe prioritaire", source == "logo.png" and data == external)
+        check("Alluco.png externe prioritaire", source == "Alluco.png" and data == external)
 
         uri, source = brand_logo_data_uri(root)
-        check("Logo sidebar depuis logo.png", source == "logo.png" and uri.startswith("data:image/png;base64,"))
+        check("Logo sidebar depuis Alluco.png", source == "Alluco.png" and uri.startswith("data:image/png;base64,"))
         pdf_data, pdf_source = _pdf_brand_logo(root)
-        check("Logo PDF depuis logo.png", pdf_source == "logo.png" and pdf_data == external)
+        check("Logo PDF depuis Alluco.png", pdf_source == "Alluco.png" and pdf_data == external)
 
     if source_path:
         src = load_source_workbook(Path(source_path).read_bytes())
@@ -2506,6 +2626,8 @@ if __name__ == "__main__":
         if pwd != confirm:
             raise SystemExit("Les mots de passe ne correspondent pas.")
         print(make_password_hash(pwd))
+    elif "--verify-modifications" in sys.argv:
+        modification_self_test()
     elif "--self-test" in sys.argv:
         src = sys.argv[sys.argv.index("--input") + 1] if "--input" in sys.argv else None
         self_test(src)
