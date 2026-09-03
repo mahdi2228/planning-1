@@ -85,8 +85,8 @@ APP_NAME = "ALLUCO — Planning Laquage IA"
 APP_SUBTITLE = "Agentic AI · Planning industriel · Portail Client"
 ROOT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT_DIR / "config.toml"
-LOGO_PATH = ROOT_DIR / "Alluco.png"
-# Conservé comme repère de packaging historique; la priorité runtime reste Alluco.png.
+LOGO_PATH = ROOT_DIR / "logo.png"
+# Conservé comme repère de packaging historique; la priorité runtime reste logo.png.
 LEGACY_LOGO_PATH = ROOT_DIR / "Alluco.png"
 EMBEDDED_LOGO_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAAGAAAABgCAYAAADimHc4AAAFFElEQVR4nO2c3VPUZRTHvwvL8rq4LKAUkgQGsygIiwIubxLMQoBOKgn4B3TfXRfe9Ac0003TTLd10wwmyFiSbWSO8iKTYVCIE5ZoiopSpgQKvy4YZqIBfmd3n/2dp/F87tg9z3MOfHhef7C2tLLjBgQ2orgLeNERAcyIAGZEADMigBkRwIwIYEYEMCMCmBEBzIgAZkQAMyKAGRHAjAhgRgQwIwKYEQHMiABmRAAzIoAZEcCMCGBGBDAjApgRAcyIAGZEADMigBkRwIwIYEYEMCMCmLFzF0Ch0utB90cngmpjGAZKD7+D6Tv3I1SVGv4XI6CjpSboNjabDR0t1RGoRi3aC0iIj8XB+rKQ2rY3V8NmsymuSC3aCzhYV4bE+LiQ2u7I3IqK4nzFFalFewEdrcFPP2vahzB9WYnWArZnpKLS6wmrj0P15YiPcyiqSD1aC2hvqQl7Dk9KiENrXWhriBXoLaBZzS5G52lIWwFle/Lw6vZtSvqqKi1A5rZUJX2pRlsBncTf2qfzC6YxUVE2HFM0mlSjpYC4WAcO1ZeTYk988AkpTtdDmZYCWg7sRXJSgmnclZ+m8GnPt7g9M2sam5OVgX1FeSrKU4qWAtqJ08/JvoswDAOnzg2Q4nUcBdoJeCk9BbX7dpvGLS0v49S5QQBA19mLpL7fbKhArCMmrPpUo52AY83ViIoy3/tfGBnHvdk5AMD49ZuYmLpl2iY5KQHNtXvDLVEp2gmg7v1P9l3a9OuN6AzzakM1Wgko3bUTr2W/bBq3sPgMZ/ovr3mNKqC2rBAZaSkh1RcJtBLQTlwk+y58j8dP5te8Nn3nPi5fnTRtu3ImqAqpvkigjQCHIwaH/ftJsRstutRRQBVtBdoIaKr2wuVMNI2be/wEgYHRdd/rDgzh+dKSaR952Znw7soNusZIoI0A6uLYGxjG4rPn6743++hPnB8aI/Wj6qIvXLQQkO7eggPlhaTYrr7N9/xm769ypNEHhwZnAi0EvPVGJezR0aZxv997iIErE5vGfHF+BPN/L5r25XImoqnaS64xUmghgHpf//lXl2AYm3/O7NP5BXz53QgxL/80xC6gKD8bntwsUiz1yoG6G6qrKMLWVBcpNlKwC6Auvtdu3Mb49Zuk2P7Bq3j4x1+mcfboaLQ1+Uh9Rgob52dHx9ijMXbmQ7hdTq4S8PMv06g5/i5bftYR4K8qYf3hA4AnNwtF+dls+VkFUO/9Iw3nBR2bALfLiQZfMVf6NRzx+xBjN98GRwI2AW2NlWzf9H9xu5zwV5Ww5GYToMMe/N9wTYcsAjy5WShkXPjWo8FXjNSUZMvzsgjQ7akUsLIlPuq3/kxg+X/IrBx+Kkmxw6OTaHn7vbBzDnW9j5ysDNO4ztYafPzZ2bDzBYPlI+D1/UVId28hxXYHBpXkPB0YIsXtztuBgp2vKMlJxXIB1Is3wzDQGxhWkrOHKACwfnq0VIDLmYhG4nZvaHQSdx88UpJ3bPI3TE3fJcW2NdGuxlVhqYBgHoL0fK1m+lnl9De00ZSWkox63x6luTfDUgHU6Wd52UBvv5rpZxXqOgBYe0axTEBediZKCnJIsYM/TGDmwZzS/D9e+xU3bs2QYv1VXqQkJynNvxGWCQjmT0GCWTSDgToKHDF2HG205kzA+jxA0OCJ2IuOCGBGBDAjApgRAcyIAGZEADMigBkRwIwIYEYEMCMCmBEBzIgAZkQAMyKAGRHAjAhgRgQw8w/6og9yf5DZpAAAAABJRU5ErkJggg=="
 
@@ -266,18 +266,18 @@ def bytes_from_path(path: Path) -> bytes:
 
 
 def load_brand_logo(root_dir: Optional[Path] = None, embedded_base64: Optional[str] = None) -> Tuple[bytes, str]:
-    """Charge le logo de marque avec priorité stricte à ``Alluco.png``.
+    """Charge le logo de marque avec priorité stricte à ``logo.png``.
 
-    Ordre: ``<root>/Alluco.png`` -> Base64 embarqué. ``Alluco.png`` reste un asset
+    Ordre: ``<root>/logo.png`` -> Base64 embarqué. ``Alluco.png`` reste un asset
     historique de packaging mais n'est volontairement pas prioritaire ici.
     """
     root = Path(root_dir) if root_dir is not None else ROOT_DIR
-    external = root / "Alluco.png"
+    external = root / "logo.png"
     if external.is_file():
         try:
             data = external.read_bytes()
             if data:
-                return data, "Alluco.png"
+                return data, "logo.png"
         except OSError:
             pass
 
@@ -1606,7 +1606,7 @@ def export_planning_excel(result: Dict[str, Any]) -> bytes:
 
 
 def _pdf_brand_logo(root_dir: Optional[Path] = None) -> Tuple[bytes, str]:
-    # Même source que la sidebar: garantit Alluco.png > Base64 partout.
+    # Même source que la sidebar: garantit logo.png > Base64 partout.
     return load_brand_logo(root_dir)
 
 
@@ -2463,14 +2463,14 @@ def self_test(source_path: Optional[str] = None) -> None:
         check("Fallback logo Base64", source == "embedded-base64" and data == embedded)
 
         external = b"external-logo-priority-test"
-        (root / "Alluco.png").write_bytes(external)
+        (root / "logo.png").write_bytes(external)
         data, source = load_brand_logo(root)
-        check("Alluco.png externe prioritaire", source == "Alluco.png" and data == external)
+        check("logo.png externe prioritaire", source == "logo.png" and data == external)
 
         uri, source = brand_logo_data_uri(root)
-        check("Logo sidebar depuis Alluco.png", source == "Alluco.png" and uri.startswith("data:image/png;base64,"))
+        check("Logo sidebar depuis logo.png", source == "logo.png" and uri.startswith("data:image/png;base64,"))
         pdf_data, pdf_source = _pdf_brand_logo(root)
-        check("Logo PDF depuis Alluco.png", pdf_source == "Alluco.png" and pdf_data == external)
+        check("Logo PDF depuis logo.png", pdf_source == "logo.png" and pdf_data == external)
 
     if source_path:
         src = load_source_workbook(Path(source_path).read_bytes())
