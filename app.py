@@ -141,7 +141,7 @@ PLAN_CFG = APP_CONFIG.get("planning", {})
 UI_CFG = APP_CONFIG.get("ui", {})
 APP_TIMEZONE = str(UI_CFG.get("timezone", "Africa/Tunis"))
 
-SOURCE_FILENAME = str(DATA_CFG.get("source_file", "Bd-Client-S36.xlsx"))
+SOURCE_FILENAME = str(DATA_CFG.get("source_file", "Bd-Client-S37.xlsx"))
 SOURCE_PATH = ROOT_DIR / SOURCE_FILENAME
 
 DEFAULT_YEAR = int(PLAN_CFG.get("year", 2026))
