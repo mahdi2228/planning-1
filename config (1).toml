@@ -1,0 +1,45 @@
+# ALLUCO - configuration planning Lundi -> Vendredi
+
+[data]
+# Le fichier Excel doit etre dans le meme dossier / depot GitHub que app.py
+source_file = "extraction_ax.xlsx"
+
+[planning]
+year = 2026
+week = 38
+
+# Capacite de production pour chaque jour Lundi -> Vendredi
+capacity_weekday_h = 16.0
+
+# Regle observee dans le planning historique : 4 minutes par balancelle
+minutes_per_bal = 4.0
+
+# Consommation poudre = Poids total x coefficient
+powder_coeff = 0.052
+
+# Temps ajoute si une deuxieme couleur est utilisee dans une journee
+cleaning_min = 15
+
+# Charge cible du moteur d'optimisation
+target_utilization = 0.94
+
+# Temps maximum laisse au solveur pour chercher une bonne solution
+solver_seconds = 18.0
+
+# Generation automatique a l'ouverture / changement de source
+auto_generate = true
+
+# Re-laquage desactive par defaut pour eviter de consommer le meme stock deux fois
+allow_relaquage = false
+
+# Parametres de taille du pool d'optimisation
+max_jobs = 1600
+pool_factor = 2.7
+
+# Regles de planning cible
+max_colors_per_day = 2
+include_without_of = false
+forbid_white_black_adjacent = true
+
+[ui]
+timezone = "Africa/Tunis"
