@@ -1013,16 +1013,21 @@ def assign_jobs_ortools(jobs: List[Job], cfg: PlannerConfig) -> Tuple[Dict[str, 
         n_colors = sum(active)
         color_limit = PREFERRED_COLORS_PER_DAY if cfg.strategy == "Mono-couleur" else HARD_MAX_COLORS_PER_DAY
         model.Add(n_colors <= color_limit)
-        second_color = model.NewBoolVar(f"second_color_{d}")
-        model.Add(n_colors <= 1 + second_color)
-        objective.append(second_color * w["two_color"] * 1000)
+        # AX: 1 a 4 couleurs sont possibles. Chaque couleur supplementaire
+        # implique un changement/nettoyage, sans bloquer artificiellement a 2.
+        has_color = model.NewBoolVar(f"has_color_{d}")
+        model.Add(n_colors >= has_color)
+        model.Add(n_colors <= HARD_MAX_COLORS_PER_DAY * has_color)
+        extra_colors = model.NewIntVar(0, max(0, HARD_MAX_COLORS_PER_DAY - 1), f"extra_colors_{d}")
+        model.Add(extra_colors == n_colors - has_color)
+        objective.append(extra_colors * w["two_color"] * 1000)
 
         prod = sum(jobs[ji].duration_min * x[(ji, d)] for ji in range(len(jobs)))
-        model.Add(prod + cfg.cleaning_min * second_color <= cap)
+        model.Add(prod + cfg.cleaning_min * extra_colors <= cap)
 
         target = int(round(cap * cfg.target_utilization))
         load = model.NewIntVar(0, cap, f"load_{d}")
-        model.Add(load == prod + cfg.cleaning_min * second_color)
+        model.Add(load == prod + cfg.cleaning_min * extra_colors)
         dev = model.NewIntVar(0, cap, f"dev_{d}")
         model.Add(dev >= target - load)
         model.Add(dev >= load - target)
@@ -1094,8 +1099,8 @@ def _fallback_day_cost(job: Job, d: int, loads: List[int], colors_by_day: List[s
     ncolors = len(colors_by_day[d]) + (1 if new_color else 0)
     if ncolors > HARD_MAX_COLORS_PER_DAY:
         return float("inf")
-    cleaning = cfg.cleaning_min if ncolors == 2 else 0
-    current_cleaning = cfg.cleaning_min if len(colors_by_day[d]) == 2 else 0
+    cleaning = cfg.cleaning_min * max(0, ncolors - 1)
+    current_cleaning = cfg.cleaning_min * max(0, len(colors_by_day[d]) - 1)
     projected = loads[d] - current_cleaning + job.duration_min + cleaning
     if projected > cap:
         return float("inf")
@@ -1106,8 +1111,8 @@ def _fallback_day_cost(job: Job, d: int, loads: List[int], colors_by_day: List[s
     if not colors_by_day[d]:
         mono_pen = 80
     elif new_color:
-        # En mode mono-couleur, une deuxième couleur n’est utilisée qu’en dernier recours.
-        mono_pen = 1_000_000_000 if cfg.strategy == "Mono-couleur" else 120_000
+        # En mode generique, une nouvelle couleur est penalisee mais reste autorisee jusqu'a 4.
+        mono_pen = 1_000_000_000 if cfg.strategy == "Mono-couleur" else 45_000 * max(1, ncolors - 1)
     else:
         mono_pen = -25_000
     due_pen = late * (45000 if cfg.strategy == "Délais clients" else 28000)
@@ -1171,8 +1176,8 @@ def _state_from_assignments(jobs: List[Job], assignments: Dict[str, int], cfg: P
         loads[d] += j.duration_min
         colors[d].add(j.color)
     for d in range(6):
-        if len(colors[d]) == 2:
-            loads[d] += cfg.cleaning_min
+        if len(colors[d]) > 1:
+            loads[d] += cfg.cleaning_min * (len(colors[d]) - 1)
     return by_id, loads, colors, day_jobs
 
 
@@ -1191,9 +1196,9 @@ def _can_place(job: Job, d: int, loads: List[int], colors: List[set], cfg: Plann
     new_colors.add(job.color)
     if len(new_colors) > HARD_MAX_COLORS_PER_DAY:
         return False
-    # cleaning state estimated conservatively: if 2 colors after placement, reserve cleaning.
-    clean_after = cfg.cleaning_min if len(new_colors) == 2 else 0
-    clean_before = cfg.cleaning_min if len(current_colors) == 2 else 0
+    # AX: un nettoyage/changement par couleur supplementaire.
+    clean_after = cfg.cleaning_min * max(0, len(new_colors) - 1)
+    clean_before = cfg.cleaning_min * max(0, len(current_colors) - 1)
     prod_before = current_load - clean_before
     return prod_before + job.duration_min + clean_after <= cap + 1e-9
 
@@ -1344,8 +1349,8 @@ def planning_metrics(days: Dict[int, pd.DataFrame], cfg: PlannerConfig, unschedu
         df = days[d]
         production = float(pd.to_numeric(df.get("tps", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
         colors = list(dict.fromkeys(df.get("Couleur", pd.Series(dtype=str)).dropna().astype(str).str.upper().tolist()))
-        cleaning_h = cfg.cleaning_min / 60.0 if len(colors) == 2 else 0.0
-        if len(colors) == 2:
+        cleaning_h = (cfg.cleaning_min * max(0, len(colors) - 1)) / 60.0
+        if len(colors) > 1:
             two_color_days += 1
         total = production + cleaning_h
         cap = day_capacity_h(cfg, d)
@@ -1404,9 +1409,9 @@ def validate_plan(days: Dict[int, pd.DataFrame], lines: pd.DataFrame, cfg: Plann
         if dm["Charge totale h"] > dm["Capacité h"] + 1e-6:
             hard.append(f"{dm['Jour']}: surcharge {dm['Charge totale h']:.2f}h > {dm['Capacité h']:.2f}h.")
         if dm["Nb couleurs"] > HARD_MAX_COLORS_PER_DAY:
-            hard.append(f"{dm['Jour']}: {dm['Nb couleurs']} couleurs > maximum 2.")
-        if dm["Nb couleurs"] == 2:
-            soft.append(f"{dm['Jour']}: 2 couleurs utilisées; 1 couleur reste la cible préférée.")
+            hard.append(f"{dm['Jour']}: {dm['Nb couleurs']} couleurs > maximum {HARD_MAX_COLORS_PER_DAY}.")
+        if dm["Nb couleurs"] > 1:
+            soft.append(f"{dm['Jour']}: {dm['Nb couleurs']} couleurs planifiees (autorisees jusqu'a {HARD_MAX_COLORS_PER_DAY} selon campagne AX).")
 
     # Contrôle de séquence BLANC <-> NOIR/DARK.
     day_colors = []
@@ -1517,7 +1522,7 @@ def generate_agentic_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str,
 
     jobs, oversized = build_jobs(lines, cfg)
     selected_jobs, outside_jobs = select_candidate_pool(jobs, cfg)
-    strategies = ["Délais clients", "Mono-couleur", "Équilibre"] if cfg.strategy == "Auto — meilleur compromis" else [cfg.strategy]
+    strategies = ["Délais clients", "Équilibre"] if cfg.strategy == "Auto — meilleur compromis" else [cfg.strategy]
     per_seconds = max(3.0, cfg.solver_seconds / max(1, len(strategies)))
 
     results = []
@@ -1529,8 +1534,7 @@ def generate_agentic_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str,
         results.append(r)
 
     # V6.3: priorité à la validité, aux délais et à la couverture du planning.
-    # Une couleur/jour reste préférée, mais une 2e couleur est autorisée quand elle
-    # permet de mieux utiliser la capacité et de réduire le backlog. Jamais plus de 2.
+    # Les campagnes AX peuvent utiliser 1 a 4 couleurs selon le besoin et la capacite.
     best = min(results, key=lambda r: (
         len(r["hard_errors"]),
         r["metrics"]["overdue_unscheduled"],
@@ -1550,7 +1554,7 @@ def generate_agentic_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str,
             "Charge h": r["metrics"]["total_load_h"],
             "Utilisation %": r["metrics"]["utilization_pct"],
             "Jours mono-couleur": r["metrics"]["mono_color_days"],
-            "Jours 2 couleurs": r["metrics"]["two_color_days"],
+            "Jours multi-couleurs": r["metrics"]["two_color_days"],
             "Retards backlog": r["metrics"]["overdue_unscheduled"],
             "Retard planifié (jours)": r["metrics"]["late_days_sum"],
             "Backlog": len(r["unscheduled"]),
@@ -1571,8 +1575,8 @@ def generate_agentic_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str,
         ("Agent Quantités", "OK", "Lancement, poids, poudre, balancelles et temps recalculés automatiquement."),
         ("Agent Priorités", "OK", "Délais, retards, ancienneté, OF et disponibilité matière scorés."),
         ("Agent Scénarios", "OK", f"{len(results)} scénario(s) comparé(s); {best['selected_strategy']} retenu."),
-        ("Agent Planificateur", "OK", f"{best['engine']} · contrainte dure: maximum 2 couleurs/jour."),
-        ("Agent Couleurs", "OK", f"{best['metrics']['mono_color_days']} jour(s) mono-couleur; {best['metrics']['two_color_days']} jour(s) à 2 couleurs."),
+        ("Agent Planificateur", "OK", f"{best['engine']} · contrainte dure: maximum {HARD_MAX_COLORS_PER_DAY} couleurs/jour."),
+        ("Agent Couleurs", "OK", f"{best['metrics']['mono_color_days']} jour(s) a 1 couleur; {best['metrics']['two_color_days']} jour(s) multi-couleurs."),
         ("Agent Réparation", "OK", f"{len(best['repair_log'])} correction(s) autonome(s)."),
         ("Agent Validation", "OK" if best["confidence"] == 100 else "ERREUR", f"Confiance règles {best['confidence']}% · {len(best['hard_errors'])} erreur(s) dure(s)."),
     ]
@@ -1634,13 +1638,13 @@ def export_planning_excel(result: Dict[str, Any]) -> bytes:
         ("Scénario retenu", result.get("selected_strategy", cfg.strategy)),
         ("Moteur", result["engine"]),
         ("Confiance règles", f"{result['confidence']}%"),
-        ("Politique couleur", "1 couleur/jour privilégiée · 2 maximum"),
+        ("Politique couleur", "Campagnes AX · 1 à 4 couleurs/jour selon besoin"),
         ("Charge semaine", f"{result['metrics']['total_load_h']:.2f} h"),
         ("Capacité", f"{result['metrics']['capacity_h']:.2f} h"),
         ("Samedi", "0 h automatique · réservé re-laquage / non-conforme / nouvel ajout"),
         ("Utilisation", f"{result['metrics']['utilization_pct']:.1f}%"),
         ("Jours mono-couleur", result['metrics']['mono_color_days']),
-        ("Jours à 2 couleurs", result['metrics']['two_color_days']),
+        ("Jours multi-couleurs", result['metrics']['two_color_days']),
         ("Backlog", len(result["unscheduled"])),
         ("Retards backlog", result['metrics']['overdue_unscheduled']),
     ]
@@ -1791,7 +1795,7 @@ def export_planning_pdf(result: Dict[str, Any]) -> bytes:
         ("Capacité", f"{metrics.get('capacity_h', 0):.2f} h"),
         ("Utilisation", f"{metrics.get('utilization_pct', 0):.1f}%"),
         ("Jours mono-couleur", str(metrics.get('mono_color_days', 0))),
-        ("Jours à 2 couleurs", str(metrics.get('two_color_days', 0))),
+        ("Jours multi-couleurs", str(metrics.get('two_color_days', 0))),
         ("Backlog", str(len(result.get('unscheduled', [])))),
     ]
     c.setFont("Helvetica-Bold", 10)
@@ -1973,7 +1977,7 @@ def render_planning(result: Dict[str, Any], cfg: PlannerConfig) -> None:
         ("Confiance règles", f"{result['confidence']}%", "validation déterministe"),
         ("Charge", f"{m['total_load_h']:.1f} h", f"sur {m['capacity_h']:.1f} h"),
         ("Utilisation", f"{m['utilization_pct']:.0f}%", "semaine"),
-        ("Mono-couleur", str(m["mono_color_days"]), "jour(s)"),
+        ("Jours 1 couleur", str(m["mono_color_days"]), "campagnes simples"),
         ("Multi-couleurs", str(sum(1 for x in m["days"] if x["Nb couleurs"] > 1)), "jusqu’à 4 couleurs"),
         ("Backlog", str(len(result["unscheduled"])), "ligne(s) hors semaine"),
     ]
@@ -2529,12 +2533,19 @@ def render_ui() -> None:
         strategy="Auto — meilleur compromis",
     )
 
-    # Réinitialise la semaine automatique une seule fois par nouveau jour.
+    # Réinitialise la semaine automatique au premier chargement du jour ET
+    # après déploiement d'une nouvelle version. Cela évite le retour silencieux
+    # aux valeurs minimales des widgets (2024 / S1) lorsque Streamlit nettoie
+    # l'état d'un widget temporairement masqué.
     auto_anchor = today_date.isoformat()
-    if st.session_state.get("planning_auto_anchor") != auto_anchor:
+    auto_state_version = f"{VERSION}|{auto_anchor}"
+    missing_week_state = "planning_year" not in st.session_state or "planning_week" not in st.session_state
+    stale_auto_state = st.session_state.get("planning_auto_state_version") != auto_state_version
+    if missing_week_state or stale_auto_state:
         st.session_state["planning_year"] = auto_year
         st.session_state["planning_week"] = auto_week
         st.session_state["planning_auto_anchor"] = auto_anchor
+        st.session_state["planning_auto_state_version"] = auto_state_version
 
     with st.sidebar:
         _brand()
@@ -2589,7 +2600,7 @@ def render_ui() -> None:
                 f"Semaine automatique du jour: S{auto_week} / {auto_year} · "
                 f"{auto_dates[0].strftime('%d/%m')} → {auto_dates[5].strftime('%d/%m')}"
             )
-            objective = st.selectbox("Objectif", ["Auto — meilleur compromis", "Délais clients", "Mono-couleur", "Équilibre"])
+            objective = st.selectbox("Objectif", ["Campagnes AX — automatique", "Délais clients", "Équilibre"], index=0)
             cap = float(st.number_input("Capacité Lun–Ven (h)", 1.0, 24.0, DEFAULT_CAPACITY_H, 0.5))
             sat = st.checkbox(
                 "Production normale samedi",
@@ -2612,6 +2623,7 @@ def render_ui() -> None:
         st.markdown("<span class='status-ok'>● Source production connectée</span>", unsafe_allow_html=True)
         st.caption(SOURCE_FILENAME)
         st.caption("OR-Tools: " + ("actif" if ORTOOLS_AVAILABLE else "fallback local"))
+        st.markdown("<span class='private-badge'>Mode prive administrateur</span>", unsafe_allow_html=True)
 
     cfg = PlannerConfig(
         year=year, week=week, capacity_h=cap,
@@ -2638,6 +2650,7 @@ def render_ui() -> None:
 
     if nav == "🤖 Planning IA":
         _top("Planning IA", "Optimisation, contrôle et publication du planning de production.", cfg)
+        _admin_publication_banner(file_signature)
         c1, c2, c3 = st.columns([2, 1, 1])
         with c1:
             st.markdown(f"<div class='card'><b>Source production</b><br><span class='subtitle'>{_esc(SOURCE_FILENAME)}</span><br><span class='subtitle'>{format_num(len(source))} lignes détectées</span></div>", unsafe_allow_html=True)
@@ -2650,7 +2663,7 @@ def render_ui() -> None:
             cfg = dc_replace(cfg, year=regen_year, week=regen_week)
             signature = _source_signature(SOURCE_PATH, cfg)
         with c3:
-            st.markdown("<div class='card'><b>Couleurs / jour</b><br><span class='subtitle'>1 privilégiée</span><br><span class='subtitle'>2 maximum</span></div>", unsafe_allow_html=True)
+            st.markdown("<div class='card'><b>Campagnes couleur</b><br><span class='subtitle'>profil atelier S38</span><br><span class='subtitle'>4 couleurs maximum</span></div>", unsafe_allow_html=True)
         try:
             result = ensure_plan(regenerate) if DEFAULT_AUTO_GENERATE else st.session_state.get("plan_result")
         except Exception as exc:
@@ -2663,6 +2676,7 @@ def render_ui() -> None:
 
     elif nav == "🏠 Tableau de bord":
         _top("Tableau de bord", "Vue opérationnelle des commandes, retards et capacité.", cfg)
+        _admin_publication_banner(file_signature)
         master = learn_source_master(source, cfg.powder_coeff, cfg.minutes_per_bal)
         lines, quality = build_candidate_lines(source, master, cfg)
         overdue = int((pd.to_numeric(lines.get("_overdue_days"), errors="coerce").fillna(0) > 0).sum()) if not lines.empty else 0
@@ -2689,6 +2703,7 @@ def render_ui() -> None:
 
     elif nav == "🧠 Analyse IA":
         _top("Analyse IA", "Scénarios, décisions, réparations et backlog.", cfg)
+        _admin_publication_banner(file_signature)
         try:
             result = ensure_plan(False)
         except Exception as exc:
@@ -2728,16 +2743,17 @@ def render_ui() -> None:
 
     else:
         _top("Paramètres", "Règles et état de sécurité du moteur.", cfg)
+        _admin_publication_banner(file_signature)
         rules = pd.DataFrame([
             ["Fichier source", SOURCE_FILENAME],
             ["Historique planning", "Aucun fichier historique requis"],
-            ["Couleurs / jour", "1 privilégiée · 2 maximum (dur)"],
+            ["Couleurs / jour", "1 à 4 selon campagnes AX · maximum 4"],
             ["Séquence blanc/noir", "BLANC + NOIR/DARK interdit le même jour"],
             ["Capacité Lun–Ven", f"{cfg.capacity_h:.1f} h/j"],
             ["Samedi", "0 h automatique · réservé re-laquage / non-conforme / nouvel ajout"],
             ["Cadence", f"{cfg.minutes_per_bal:.1f} min/bal"],
             ["Poudre", f"coefficient {cfg.powder_coeff:.3f}"],
-            ["Changement couleur", f"{cfg.cleaning_min} min entre 2 couleurs"],
+            ["Changement couleur", f"{cfg.cleaning_min} min par changement si applicable"],
             ["EC40100", "14 pièces / balancelle"],
             ["Optimisation", "3 scénarios + CP-SAT OR-Tools + réparation agentique"],
             ["Admin", f"Utilisateur {admin_username()} · accès configuré" if admin_auth_configured() else "NON CONFIGURÉ"],
@@ -2757,7 +2773,7 @@ def render_ui() -> None:
 # le pool métier déjà préparé (Lancement / Re-laquage / stock), puis applique les
 # règles de campagnes observées/validées sur le planning atelier S38.
 
-VERSION = "6.4.0-S38"
+VERSION = "6.6.0-AX"
 _CONFIGURED_SOURCE = str(DATA_CFG.get("source_file", "")).strip()
 _S38_SOURCE = ROOT_DIR / "extraction AX version 0.xlsx"
 # Si le fichier S38 est livré avec l'application, il devient la source prioritaire.
@@ -3188,13 +3204,13 @@ def _prepared_profile_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str
     confidence = 100 if not hard_errors else max(0, 100 - min(100, 25 * len(hard_errors)))
 
     scenario_table = pd.DataFrame([{
-        "Scénario": "Profil atelier S38",
+        "Scénario": "Campagnes AX S38",
         "Moteur": "Campagnes métier déterministes",
         "Confiance règles %": confidence,
         "Charge h": metrics["total_load_h"],
         "Utilisation %": metrics["utilization_pct"],
         "Jours mono-couleur": metrics["mono_color_days"],
-        "Jours 2 couleurs": metrics["two_color_days"],
+        "Jours multi-couleurs": metrics["two_color_days"],
         "Retards backlog": 0,
         "Retard planifié (jours)": 0,
         "Backlog": len(backlog),
@@ -3214,11 +3230,11 @@ def _prepared_profile_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str
             "Les lancements stock BLC sans numéro de commande sont conservés et planifiables.",
         ],
         "confidence": confidence,
-        "engine": "Profil atelier S38 déterministe",
+        "engine": "Campagnes AX déterministes",
         "repair_log": [],
         "scenario_score": float(len(backlog)),
         "quality": {"source_rows": len(source), "eligible_lines": len(source), "mode": "prepared_vf"},
-        "selected_strategy": "Profil atelier S38",
+        "selected_strategy": "Campagnes AX S38",
         "scenario_table": scenario_table,
         "master": None,
         "lines": source,
@@ -3313,6 +3329,428 @@ def export_planning_excel(result: Dict[str, Any]) -> bytes:
     return out.getvalue()
 
 
+
+# =============================================================================
+# 14C) PUBLICATION FIABLE + UI PROFESSIONNELLE AX
+# =============================================================================
+# Publication persistante: le client doit continuer a voir le dernier planning
+# explicitement publie, meme si la source AX est actualisee ou si Streamlit rerun.
+PUBLISHED_PLAN_PATH = ROOT_DIR / "planning_client_publie.json"
+
+
+def app_now() -> datetime:
+    """Heure locale de l'application, coherente avec APP_TIMEZONE."""
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(APP_TIMEZONE))
+        except Exception:
+            pass
+    return datetime.now()
+
+
+def _load_published_plan_file() -> Optional[Dict[str, Any]]:
+    if not PUBLISHED_PLAN_PATH.is_file():
+        return None
+    try:
+        payload = json.loads(PUBLISHED_PLAN_PATH.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) and payload.get("commands") is not None else None
+    except Exception:
+        return None
+
+
+def _save_published_plan_file(payload: Dict[str, Any]) -> bool:
+    try:
+        PUBLISHED_PLAN_PATH.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _delete_published_plan_file() -> None:
+    try:
+        if PUBLISHED_PLAN_PATH.exists():
+            PUBLISHED_PLAN_PATH.unlink()
+    except Exception:
+        pass
+
+
+def get_published_plan() -> Optional[Dict[str, Any]]:
+    """Retourne le snapshot publie en memoire ou depuis le fichier persistant."""
+    registry = _shared_plan_registry()
+    published = registry.get("published")
+    if isinstance(published, dict):
+        if int(published.get("publication_schema", 0) or 0) == 2:
+            return published
+        # Les anciennes publications (ex. S1/2024) ne sont jamais reutilisees
+        # apres la migration V6.6: l'administrateur doit republier le planning valide.
+        registry.pop("published", None)
+    published = _load_published_plan_file()
+    if isinstance(published, dict) and int(published.get("publication_schema", 0) or 0) == 2:
+        registry["published"] = published
+        return published
+    if isinstance(published, dict):
+        _delete_published_plan_file()
+    return None
+
+
+def _publication_period_text(published: Dict[str, Any]) -> str:
+    try:
+        year = int(published.get("year"))
+        week = int(published.get("week"))
+        dates = iso_week_dates(year, week)
+        return f"{dates[0].strftime('%d/%m/%Y')} -> {dates[4].strftime('%d/%m/%Y')}"
+    except Exception:
+        return "—"
+
+
+def _publication_cfg(published: Optional[Dict[str, Any]], fallback: PlannerConfig) -> PlannerConfig:
+    if not published:
+        return fallback
+    try:
+        return dc_replace(
+            fallback,
+            year=int(published.get("year", fallback.year)),
+            week=int(published.get("week", fallback.week)),
+            strategy="Campagnes AX — publié",
+        )
+    except Exception:
+        return fallback
+
+
+def _public_plan_payload(result: Dict[str, Any], source_signature: str) -> Dict[str, Any]:
+    """Snapshot client derive exclusivement du planning effectivement publie."""
+    cfg: PlannerConfig = result["config"]
+    year, week = int(cfg.year), int(cfg.week)
+    week_dates = iso_week_dates(year, week)
+    commands: Dict[str, Dict[str, Any]] = {}
+    for d in range(6):
+        df = result["days"].get(d)
+        if df is None or df.empty:
+            continue
+        # Les lignes stock sans numero de commande ne sont pas exposees au portail client.
+        work = df[df.get("NumCommande", pd.Series(index=df.index, dtype=object)).map(lambda x: bool(norm_text(x)))].copy()
+        if work.empty:
+            continue
+        for cmd, g in work.groupby("NumCommande", sort=False):
+            key = norm_text(cmd).upper()
+            if not key:
+                continue
+            entry = commands.setdefault(key, {
+                "status": "PLANIFIE", "days": [], "colors": [], "hours": 0.0, "lines": 0,
+            })
+            entry["days"].append({"day": DAYS[d].title(), "date": week_dates[d].strftime("%d/%m/%Y")})
+            entry["colors"].extend(g.get("Couleur", pd.Series(dtype=str)).dropna().astype(str).str.upper().tolist())
+            entry["hours"] += float(pd.to_numeric(g.get("tps", pd.Series(dtype=float)), errors="coerce").fillna(0).sum())
+            entry["lines"] += int(len(g))
+
+    backlog = result.get("unscheduled", pd.DataFrame())
+    if backlog is not None and not backlog.empty and "NumCommande" in backlog.columns:
+        backlog = backlog[backlog["NumCommande"].map(lambda x: bool(norm_text(x)))].copy()
+        for cmd, g in backlog.groupby("NumCommande", sort=False):
+            key = norm_text(cmd).upper()
+            if key and key not in commands:
+                commands[key] = {
+                    "status": "BACKLOG", "days": [],
+                    "colors": list(dict.fromkeys(g.get("Couleur", pd.Series(dtype=str)).dropna().astype(str).str.upper().tolist())),
+                    "hours": round(float(pd.to_numeric(g.get("tps", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()), 2),
+                    "lines": int(len(g)),
+                }
+    for entry in commands.values():
+        entry["colors"] = list(dict.fromkeys(entry.get("colors", [])))
+        entry["hours"] = round(float(entry.get("hours", 0.0)), 2)
+
+    now = app_now()
+    return {
+        "publication_schema": 2,
+        "source_signature": source_signature,
+        "published_at": now.strftime("%d/%m/%Y %H:%M"),
+        "published_at_iso": now.isoformat(timespec="seconds"),
+        "year": year,
+        "week": week,
+        "week_start": week_dates[0].strftime("%d/%m/%Y"),
+        "week_end": week_dates[4].strftime("%d/%m/%Y"),
+        "strategy": norm_text(result.get("selected_strategy")) or "Campagnes AX",
+        "engine": norm_text(result.get("engine")) or "Campagnes AX",
+        "confidence": int(result.get("confidence", 0)),
+        "max_colors_per_day": int(HARD_MAX_COLORS_PER_DAY),
+        "commands": commands,
+    }
+
+
+def _color_visual_style(color: str) -> Tuple[str, str, str]:
+    """Retourne fond, texte, bordure pour une puce couleur lisible."""
+    c = norm_text(color).upper()
+    palette = {
+        "BLC": ("#FFFFFF", "#172033", "#CBD5E1"),
+        "BLANC": ("#FFFFFF", "#172033", "#CBD5E1"),
+        "R9016": ("#F8FAFC", "#172033", "#CBD5E1"),
+        "NOIR": ("#111827", "#FFFFFF", "#111827"),
+        "DARK": ("#374151", "#FFFFFF", "#374151"),
+        "GRIS": ("#A8ADB5", "#172033", "#8B929C"),
+        "GREY": ("#C2C7CE", "#172033", "#9CA3AF"),
+        "GRISG": ("#6B7280", "#FFFFFF", "#5B6270"),
+        "R7016": ("#4B5563", "#FFFFFF", "#374151"),
+        "ACAJOU": ("#8B4A2F", "#FFFFFF", "#743A24"),
+        "CHPG": ("#D9C9A3", "#172033", "#BCA97C"),
+        "FRENE": ("#D9C7A3", "#172033", "#BFAE8B"),
+        "TECK": ("#9A6B43", "#FFFFFF", "#805536"),
+        "NOYER": ("#6F4A2F", "#FFFFFF", "#5C3C27"),
+        "SAND": ("#D9C3A5", "#172033", "#C0A985"),
+        "R8019": ("#4B3934", "#FFFFFF", "#3D2E2A"),
+        "N02": ("#6B6F76", "#FFFFFF", "#555A61"),
+        "N07": ("#565B62", "#FFFFFF", "#464B52"),
+        "N22": ("#454A50", "#FFFFFF", "#373B40"),
+    }
+    return palette.get(c, ("#EEF4FF", "#155EEF", "#C7D7FE"))
+
+
+def _color_pills_html(colors: Iterable[Any]) -> str:
+    values = list(dict.fromkeys(norm_text(x).upper() for x in colors if norm_text(x)))[:HARD_MAX_COLORS_PER_DAY]
+    chips = []
+    for c in values:
+        bg, fg, bd = _color_visual_style(c)
+        chips.append(
+            f"<span class='ax-color-chip' style='background:{bg};color:{fg}!important;border-color:{bd};'>"
+            f"<span class='ax-color-dot' style='background:{bg};border-color:{bd};'></span>{_esc(c)}</span>"
+        )
+    return "".join(chips)
+
+
+def _day_color_policy_html(sequence: str) -> str:
+    colors = list(dict.fromkeys(norm_text(x).upper() for x in str(sequence or "").split("→") if norm_text(x)))
+    colors = colors[:HARD_MAX_COLORS_PER_DAY]
+    label = "Couleur du jour" if len(colors) == 1 else "Campagne couleurs du jour"
+    note = f"{len(colors)} couleur(s) planifiee(s) · base AX · maximum {HARD_MAX_COLORS_PER_DAY}"
+    return (
+        f"<div class='color-policy'><div><div class='color-policy-label'>{label}</div>"
+        f"<div class='color-pills'>{_color_pills_html(colors)}</div></div>"
+        f"<div class='color-policy-note'>{_esc(note)}</div></div>"
+    )
+
+
+# Ajout CSS professionnel sans toucher au theme existant.
+_legacy_build_css_v66 = build_css
+
+def build_css(dark: bool = False) -> str:
+    base = _legacy_build_css_v66(dark)
+    return base + """
+<style>
+.ax-color-chip{display:inline-flex;align-items:center;gap:.38rem;border:1px solid;border-radius:999px;padding:.36rem .64rem;font-size:.78rem;font-weight:900;letter-spacing:.01em;box-shadow:0 1px 2px rgba(16,24,40,.06)}
+.ax-color-dot{display:inline-block;width:.62rem;height:.62rem;border:1px solid;border-radius:50%;box-shadow:inset 0 0 0 1px rgba(255,255,255,.25)}
+.publish-banner{border:1px solid var(--line);border-left:5px solid var(--green);background:var(--card);border-radius:14px;padding:.82rem 1rem;margin:.45rem 0 .9rem}
+.publish-banner.off{border-left-color:var(--amber)}
+.publish-title{font-weight:950;font-size:.9rem}.publish-meta{font-size:.78rem;color:var(--muted)!important;margin-top:.2rem}
+.private-badge{display:inline-flex;align-items:center;gap:.4rem;background:var(--softblue);border:1px solid var(--line);border-radius:999px;padding:.34rem .62rem;font-size:.75rem;font-weight:900;color:var(--blue)!important}
+</style>
+"""
+
+
+def _admin_publication_banner(current_source_signature: str) -> None:
+    published = get_published_plan()
+    if published:
+        source_changed = published.get("source_signature") != current_source_signature
+        warning = " · source AX modifiee depuis la publication" if source_changed else ""
+        st.markdown(
+            f"<div class='publish-banner'><div class='publish-title'>● PLANNING CLIENT PUBLIE — "
+            f"S{int(published.get('week', 0))} / {int(published.get('year', 0))}</div>"
+            f"<div class='publish-meta'>{_esc(_publication_period_text(published))} · publie le "
+            f"{_esc(published.get('published_at', '—'))} · {_esc(published.get('strategy', 'Campagnes AX'))}{_esc(warning)}</div></div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<div class='publish-banner off'><div class='publish-title'>● MODE PRIVE — AUCUN PLANNING CLIENT PUBLIE</div>"
+            "<div class='publish-meta'>Vous travaillez sur une proposition interne. Les clients ne voient aucun jour de production tant que vous ne cliquez pas sur Publier.</div></div>",
+            unsafe_allow_html=True,
+        )
+
+
+def render_publish_controls(result: Dict[str, Any], source_signature: str) -> None:
+    st.markdown("#### Publication espace client")
+    current = get_published_plan()
+    if current:
+        source_changed = current.get("source_signature") != source_signature
+        msg = (
+            f"Publication active: S{current.get('week')} / {current.get('year')} · "
+            f"{_publication_period_text(current)} · publiee le {current.get('published_at')}"
+        )
+        st.success(msg)
+        if source_changed:
+            st.warning("La base AX a change depuis cette publication. Le client continue de voir le snapshot publie jusqu'a une nouvelle publication.")
+    else:
+        st.info("Aucune publication active. Le planning affiche ici reste prive.")
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        if result.get("hard_errors"):
+            st.warning("Publication desactivee: le planning contient une erreur bloquante.")
+        elif st.button("Publier ce planning aux clients", type="primary", use_container_width=True):
+            payload = _public_plan_payload(result, source_signature)
+            _shared_plan_registry()["published"] = payload
+            persisted = _save_published_plan_file(payload)
+            st.success(
+                f"Planning S{payload['week']} / {payload['year']} publie. "
+                f"Le portail client affiche maintenant les dates {payload['week_start']} -> {payload['week_end']}."
+            )
+            if not persisted:
+                st.caption("Publication active en memoire serveur; stockage fichier indisponible sur cet hebergement.")
+    with c2:
+        if st.button("Retirer la publication", use_container_width=True):
+            _shared_plan_registry().pop("published", None)
+            _delete_published_plan_file()
+            st.info("Publication client retiree. Le planning redevient prive.")
+
+
+def _client_order_status(rows: pd.DataFrame, plan_entry: Optional[Dict[str, Any]]) -> str:
+    ordered = float(pd.to_numeric(rows.get("QteCommandé", pd.Series(dtype=float)), errors="coerce").fillna(0).clip(lower=0).sum())
+    remaining = float(pd.to_numeric(rows.get("ResteALivrer", pd.Series(dtype=float)), errors="coerce").fillna(0).clip(lower=0).sum())
+    if ordered > 0 and remaining <= 0:
+        return "LIVREE"
+    if plan_entry and plan_entry.get("status") in {"PLANIFIE", "PLANIFIÉ"}:
+        return "PLANIFIEE"
+    prod = " ".join(rows.get("ProdStatut", pd.Series(dtype=str)).fillna("").astype(str).tolist()).lower()
+    if "commenc" in norm_key(prod):
+        return "EN PRODUCTION"
+    if plan_entry and plan_entry.get("status") == "BACKLOG":
+        return "EN ATTENTE DE PLANIFICATION"
+    return "EN COURS"
+
+
+def render_client_portal(source: pd.DataFrame, cfg: PlannerConfig, source_signature: str) -> None:
+    published = get_published_plan()
+    display_cfg = _publication_cfg(published, cfg)
+    _top("Suivi de commande", "Planning client base sur la derniere publication validee par l'atelier.", display_cfg)
+
+    if published:
+        st.markdown(
+            f"<div class='publish-banner'><div class='publish-title'>PLANNING PUBLIE · S{published.get('week')} / {published.get('year')}</div>"
+            f"<div class='publish-meta'>Periode: {_esc(_publication_period_text(published))} · mise a jour client: {_esc(published.get('published_at', '—'))}</div></div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<div class='publish-banner off'><div class='publish-title'>AUCUN PLANNING PUBLIE</div>"
+            "<div class='publish-meta'>Le suivi des quantites reste disponible, mais aucune date atelier n'est communiquee tant que l'administrateur n'a pas publie un planning.</div></div>",
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("<div class='hero'><div class='hero-title'>Consulter une commande</div><div class='hero-sub'>Saisissez le numero exact de commande. Les jours affiches proviennent uniquement du dernier planning publie.</div></div>", unsafe_allow_html=True)
+    access_required = bool(client_access_code())
+    with st.form("client_lookup_form", clear_on_submit=False):
+        command_input = st.text_input("Numero de commande", placeholder="Ex. VTE2601234", max_chars=40)
+        access_input = st.text_input("Code d'acces", type="password", max_chars=80) if access_required else ""
+        submitted = st.form_submit_button("Afficher le rapport", type="primary", use_container_width=True)
+
+    if submitted:
+        if not _client_query_allowed():
+            st.error("Trop de consultations rapprochees. Reessayez dans quelques instants.")
+            return
+        command = norm_text(command_input).upper()
+        valid_format = bool(re.fullmatch(r"[A-Z0-9][A-Z0-9._/\- ]{1,39}", command))
+        access_ok = (not access_required) or hmac.compare_digest(access_input, client_access_code())
+        rows = _client_order_rows(source, command) if valid_format and access_ok else source.iloc[0:0].copy()
+        if rows.empty:
+            st.warning("Commande introuvable ou acces invalide.")
+            return
+        st.session_state["client_last_command"] = command
+    else:
+        command = norm_text(st.session_state.get("client_last_command", "")).upper()
+        if not command:
+            st.caption("Recherche exacte par numero de commande.")
+            return
+        rows = _client_order_rows(source, command)
+        if rows.empty:
+            return
+
+    detail = _client_detail_table(rows)
+    plan_entry = published.get("commands", {}).get(command) if published else None
+    ordered = float(detail["Commandé"].sum()) if not detail.empty else 0.0
+    delivered = float(detail["Livré estimé"].sum()) if not detail.empty else 0.0
+    remaining = float(detail["Reste à livrer"].sum()) if not detail.empty else 0.0
+    progress = max(0.0, min(100.0, (delivered / ordered * 100.0) if ordered > 0 else 0.0))
+    clients = [norm_text(x) for x in rows.get("NomClient", pd.Series(dtype=str)).tolist() if norm_text(x)]
+    client_name = " · ".join(dict.fromkeys(clients)) or "—"
+    created = _first_valid_date(rows, ["DateCréation"])
+    due = _first_valid_date(rows, ["DateLivraisonConfirmé", "DateExpeditionConfirmé", "DateExpeditionDemandé"])
+    status = _client_order_status(rows, plan_entry)
+
+    st.markdown(
+        f"<div class='client-card'><div class='client-head'><div><div class='client-order'>{_esc(command)}</div>"
+        f"<div class='client-meta'>{_esc(client_name)}</div></div><span class='status-ok'>{_esc(status)}</span></div>"
+        f"<div class='progress-wrap'><div class='progress-bar' style='width:{progress:.2f}%'></div></div>"
+        f"<div class='client-meta'>{progress:.1f}% livre estime · {int(round(remaining))} restant</div></div>",
+        unsafe_allow_html=True,
+    )
+    st.write("")
+    cols = st.columns(6)
+    values = [
+        ("Commande", format_num(ordered), "unites"),
+        ("Livre estime", format_num(delivered), f"{progress:.0f}%"),
+        ("Reste", format_num(remaining), "a livrer"),
+        ("Lignes", str(len(detail)), "articles"),
+        ("Creation", created.strftime("%d/%m/%Y") if created is not None else "—", "commande"),
+        ("Echeance", due.strftime("%d/%m/%Y") if due is not None else "—", "prioritaire"),
+    ]
+    for col, val in zip(cols, values):
+        with col:
+            _kpi(*val)
+
+    st.write("")
+    left, right = st.columns([3, 2])
+    with left:
+        st.markdown("#### Quantites par ligne")
+        chart = detail[["Ligne", "Commandé", "Livré estimé", "Reste à livrer"]].set_index("Ligne")
+        st.bar_chart(chart, use_container_width=True)
+    with right:
+        st.markdown("#### Planning publie")
+        if plan_entry and plan_entry.get("status") in {"PLANIFIE", "PLANIFIÉ"}:
+            days = " · ".join(f"{x['day']} {x['date']}" for x in plan_entry.get("days", [])) or "—"
+            colors = plan_entry.get("colors", [])
+            st.success("Commande presente dans le planning publie.")
+            st.write(f"**Jour(s)** : {days}")
+            st.markdown(f"**Couleur(s)** : <span class='color-pills'>{_color_pills_html(colors)}</span>", unsafe_allow_html=True)
+            st.write(f"**Charge estimee** : {float(plan_entry.get('hours', 0)):.2f} h")
+        elif plan_entry and plan_entry.get("status") == "BACKLOG":
+            st.warning("Commande presente dans le backlog du planning publie.")
+            st.markdown(f"**Couleur(s)** : <span class='color-pills'>{_color_pills_html(plan_entry.get('colors', []))}</span>", unsafe_allow_html=True)
+        elif published:
+            st.info(f"Commande non planifiee dans la publication S{published.get('week')} / {published.get('year')}.")
+        else:
+            st.info("Aucun planning client publie.")
+        if published:
+            st.caption(
+                f"Publication officielle: S{published.get('week')} · {published.get('year')} · "
+                f"{_publication_period_text(published)} · publiee le {published.get('published_at')}"
+            )
+
+    st.markdown("#### Detail de la commande")
+    st.dataframe(detail, hide_index=True, use_container_width=True, height=min(520, 84 + len(detail) * 35))
+    report_bytes = export_client_report_excel(command, rows, plan_entry, published)
+    safe_command = re.sub(r'[^A-Z0-9_-]+', '_', command)
+    if REPORTLAB_AVAILABLE:
+        pdf_bytes = export_client_report_pdf(command, rows, plan_entry, published)
+        dl_excel, dl_pdf = st.columns(2)
+        with dl_excel:
+            st.download_button("Telecharger le rapport Excel", data=report_bytes, file_name=f"Rapport_Commande_{safe_command}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+        with dl_pdf:
+            st.download_button("Telecharger le rapport PDF", data=pdf_bytes, file_name=f"Rapport_Commande_{safe_command}.pdf", mime="application/pdf", type="primary", use_container_width=True)
+    else:
+        st.download_button("Telecharger le rapport Excel", data=report_bytes, file_name=f"Rapport_Commande_{safe_command}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+
+
+# Wrapper UI: rend le mode prive/public explicite dans toutes les pages admin.
+_legacy_render_ui_v66 = render_ui
+
+def render_ui() -> None:
+    """UI V6.6: publication explicite et semaine auto robuste."""
+    # La fonction historique construit deja toute l'interface. Les fonctions
+    # render_client_portal / render_publish_controls / build_css surchargees ci-dessus
+    # sont resolues dynamiquement et sont donc utilisees par ce rendu.
+    _legacy_render_ui_v66()
+
 # =============================================================================
 # 15) CLI / TESTS AUTOMATIQUES
 # =============================================================================
@@ -3397,13 +3835,13 @@ def self_test(source_path: Optional[str] = None) -> None:
 
     check("Article split", split_article("LMMO-S758-BLC") == ("LMMO-S758", "BLC"))
     check("ISO semaine", iso_week_dates(2026, 36)[0] == date(2026, 8, 31))
-    check("Max couleur constant", HARD_MAX_COLORS_PER_DAY == 2)
+    check("Max couleur constant", HARD_MAX_COLORS_PER_DAY == 4)
     check("Préférence mono-couleur", PREFERRED_COLORS_PER_DAY == 1)
     cfg_rules = PlannerConfig(2026, 37)
-    check("Capacité Lun-Ven 16h", all(day_capacity_h(cfg_rules, d) == 16.0 for d in range(5)))
+    check("Profil capacité S38", [day_capacity_h(cfg_rules, d) for d in range(6)] == [16.0, 16.1, 17.0, 15.5, 18.0, 0.0])
     check("Samedi verrouillé 0h", day_capacity_h(cfg_rules, 5) == 0.0)
     check("Changement couleur 15min", cfg_rules.cleaning_min == 15)
-    check("Temps balancelle 5min", cfg_rules.minutes_per_bal == 5.0)
+    check("Temps balancelle 4min", DEFAULT_MIN_PER_BAL == 4.0)
 
     css = build_css(False)
     check("Sidebar refermable/réouvrable", "stSidebarCollapseButton" in css and "stSidebarCollapsedControl" in css and "pointer-events:auto" in css)
@@ -3445,7 +3883,7 @@ def self_test(source_path: Optional[str] = None) -> None:
         check("Samedi aucune production normale", result["metrics"]["days"][5]["Capacité h"] == 0.0 and result["metrics"]["days"][5]["Lignes"] == 0)
         check("Confiance règles 100%", result["confidence"] == 100, result["hard_errors"])
         check("Capacité respectée", all(d["Charge totale h"] <= d["Capacité h"] + 1e-6 for d in result["metrics"]["days"] if d["Capacité h"] > 0), result["metrics"]["days"])
-        check("Deux couleurs maximum", all(d["Nb couleurs"] <= 2 for d in result["metrics"]["days"]), result["metrics"]["days"])
+        check("Quatre couleurs maximum", all(d["Nb couleurs"] <= 4 for d in result["metrics"]["days"]), result["metrics"]["days"])
         check("Format 28 colonnes", all(list(business_day_df(result["days"][d]).columns) == OUTPUT_COLUMNS for d in range(6)))
         planned_frames = [d for d in result["days"].values() if not d.empty]
         planned = pd.concat(planned_frames, ignore_index=True) if planned_frames else pd.DataFrame()
