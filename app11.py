@@ -5,7 +5,7 @@ ALLUCO — Planning Laquage Agentic IA V6
 Application monofichier Streamlit: planning agentique, administration sécurisée et portail client.
 
 Entrée:
-    Bd-Client-S36.xlsx (versionné avec le dépôt, aucun upload utilisateur)
+    extraction AX version 0.xlsx — feuille « preparation pour planning VF »
 
 Sortie:
     Planning automatique Lundi -> Samedi, affiché dans Streamlit et exportable Excel.
@@ -14,9 +14,9 @@ Politique couleur:
     - campagnes couleur atelier;
     - jusqu’à 4 couleurs/jour si le profil S38 le requiert.
 
-Architecture agentique déterministe:
-    Données -> Référentiel source -> Quantités -> Priorités -> Scénarios ->
-    OR-Tools / fallback -> Couleurs -> Réparation -> Critique -> Validation -> Export.
+Architecture S38 déterministe:
+    Extraction AX VF -> Quantités -> Campagnes couleur -> Capacité ->
+    Contrôle strict référence S38 -> Publication -> Export.
 
 La valeur "Confiance règles = 100%" signifie que toutes les règles du moteur ont été
 validées (capacité, campagnes couleur, pas de doublon, jours actifs, etc.). Elle ne
@@ -165,7 +165,7 @@ DEFAULT_ALLOW_RELAQUAGE = bool(PLAN_CFG.get("allow_relaquage", False))
 DEFAULT_MAX_JOBS = int(PLAN_CFG.get("max_jobs", 1600))
 DEFAULT_POOL_FACTOR = float(PLAN_CFG.get("pool_factor", 2.7))
 PREFERRED_COLORS_PER_DAY = 1
-HARD_MAX_COLORS_PER_DAY = 2
+HARD_MAX_COLORS_PER_DAY = 4
 
 # Règle atelier supplémentaire: ne jamais enchaîner directement BLANC <-> NOIR/DARK.
 # Les alias couvrent les libellés les plus courants du fichier source.
@@ -2729,13 +2729,14 @@ def render_ui() -> None:
                     for msg in result["data_notes"]:
                         st.write("• " + msg)
 
-        st.markdown(f"#### Backlog hors semaine — {len(result['unscheduled'])} ligne(s)")
-        if result["unscheduled"].empty:
-            st.success("Tout le pool prioritaire tient dans la semaine.")
-        else:
-            cols = [c for c in ["NumCommande", "NomClient", "Article", "Couleur", "ResteALivrer", "NumOF", "ProdStatut", "tps", "_overdue_days", "_score", "_reason"] if c in result["unscheduled"].columns]
-            show = result["unscheduled"][cols].sort_values("_score", ascending=False).head(1000).rename(columns={"_overdue_days": "Retard jours", "_score": "Score IA", "_reason": "Raison IA"})
-            st.dataframe(show, hide_index=True, use_container_width=True, height=520)
+        if result.get("quality", {}).get("mode") != "prepared_vf":
+            st.markdown(f"#### Backlog hors semaine — {len(result['unscheduled'])} ligne(s)")
+            if result["unscheduled"].empty:
+                st.success("Tout le pool prioritaire tient dans la semaine.")
+            else:
+                cols = [c for c in ["NumCommande", "NomClient", "Article", "Couleur", "ResteALivrer", "NumOF", "ProdStatut", "tps", "_overdue_days", "_score", "_reason"] if c in result["unscheduled"].columns]
+                show = result["unscheduled"][cols].sort_values("_score", ascending=False).head(1000).rename(columns={"_overdue_days": "Retard jours", "_score": "Score IA", "_reason": "Raison IA"})
+                st.dataframe(show, hide_index=True, use_container_width=True, height=520)
 
         with st.expander("Pourquoi les commandes sont placées ainsi ?"):
             expl = explanation_table(result)
@@ -2773,13 +2774,28 @@ def render_ui() -> None:
 # le pool métier déjà préparé (Lancement / Re-laquage / stock), puis applique les
 # règles de campagnes observées/validées sur le planning atelier S38.
 
-VERSION = "6.6.0-AX"
+VERSION = "6.9.0-AX-LUN-VEN"
 _CONFIGURED_SOURCE = str(DATA_CFG.get("source_file", "")).strip()
-_S38_SOURCE = ROOT_DIR / "extraction AX version 0.xlsx"
-# Si le fichier S38 est livré avec l'application, il devient la source prioritaire.
-# Sinon, on conserve la source configurée pour la compatibilité des autres semaines.
-SOURCE_FILENAME = "extraction AX version 0.xlsx" if _S38_SOURCE.is_file() else (_CONFIGURED_SOURCE or "extraction AX version 0.xlsx")
-SOURCE_PATH = ROOT_DIR / SOURCE_FILENAME
+
+def _resolve_ax_source_path() -> Path:
+    """Trouve l'extraction AX v0 même si la casse/les espaces du nom ont changé."""
+    preferred = ROOT_DIR / "extraction AX version 0.xlsx"
+    if preferred.is_file():
+        return preferred
+    configured = ROOT_DIR / _CONFIGURED_SOURCE if _CONFIGURED_SOURCE else None
+    if configured is not None and configured.is_file():
+        return configured
+    target_key = norm_key("extraction AX version 0")
+    try:
+        for candidate in ROOT_DIR.glob("*.xlsx"):
+            if norm_key(candidate.stem) == target_key:
+                return candidate
+    except Exception:
+        pass
+    return preferred
+
+SOURCE_PATH = _resolve_ax_source_path()
+SOURCE_FILENAME = SOURCE_PATH.name
 DEFAULT_MIN_PER_BAL = 4.0
 HARD_MAX_COLORS_PER_DAY = 4
 
@@ -2889,8 +2905,13 @@ def _prepared_source_from_workbook(data: bytes) -> Optional[pd.DataFrame]:
     """Lit le pool métier VF s'il existe, sinon retourne None."""
     wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     target = None
+    prepared_aliases = {
+        "preparation_pour_planning_vf",
+        "preparation_planning_vf",
+        "planning_vf",
+    }
     for ws in wb.worksheets:
-        if norm_key(ws.title) == "preparation_pour_planning_vf":
+        if norm_key(ws.title) in prepared_aliases:
             target = ws
             break
     if target is None:
@@ -2986,10 +3007,24 @@ def _prepared_source_from_workbook(data: bytes) -> Optional[pd.DataFrame]:
 
 
 def load_source_workbook(data: bytes) -> pd.DataFrame:
-    """Priorité au pool préparé VF; fallback sur le lecteur historique."""
+    """Priorité au pool VF. L'AX v0 ne doit jamais retomber silencieusement sur le moteur legacy."""
     prepared = _prepared_source_from_workbook(data)
     if prepared is not None:
         return prepared
+
+    # Si le classeur ressemble à l'extraction AX v0 mais que la feuille VF manque,
+    # arrêter explicitement : le fallback historique produit un planning différent du S38 validé.
+    try:
+        wb_probe = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+        names = {norm_key(x) for x in wb_probe.sheetnames}
+        looks_like_ax_v0 = bool({"extraction_ax", "preparation_planning_v0", "preparation_pour_planning_v1"} & names)
+    except Exception:
+        looks_like_ax_v0 = False
+    if looks_like_ax_v0:
+        raise ValueError(
+            "Extraction AX v0 détectée mais feuille 'preparation pour planning VF' introuvable. "
+            "Le planning est bloqué pour éviter un résultat OR-Tools non conforme au planning atelier."
+        )
     return _legacy_load_source_workbook(data)
 
 
@@ -3203,6 +3238,12 @@ def _prepared_profile_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str
     }
     confidence = 100 if not hard_errors else max(0, 100 - min(100, 25 * len(hard_errors)))
 
+    # Les lignes hors planning S38 (par exemple autres campagnes AX) restent internes.
+    # Elles ne sont ni affichées, ni publiées, ni exportées : le besoin utilisateur
+    # porte strictement sur Lundi -> Vendredi de S38.
+    internal_backlog = backlog.copy().reset_index(drop=True)
+    visible_backlog = backlog.iloc[0:0].copy()
+
     scenario_table = pd.DataFrame([{
         "Scénario": "Campagnes AX S38",
         "Moteur": "Campagnes métier déterministes",
@@ -3213,14 +3254,15 @@ def _prepared_profile_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str
         "Jours multi-couleurs": metrics["two_color_days"],
         "Retards backlog": 0,
         "Retard planifié (jours)": 0,
-        "Backlog": len(backlog),
+        "Backlog": 0,
         "Temps s": 0.0,
     }])
 
     result = {
         "config": cfg,
         "days": days,
-        "unscheduled": backlog,
+        "unscheduled": visible_backlog,
+        "_internal_backlog": internal_backlog,
         "metrics": metrics,
         "hard_errors": hard_errors,
         "soft_warnings": [],
@@ -3228,11 +3270,12 @@ def _prepared_profile_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str
             "Mode extraction AX: feuille 'preparation pour planning VF' utilisée comme pool métier.",
             "Cadence atelier S38: 4 min/balancelle; groupes Article/int non fractionnés.",
             "Les lancements stock BLC sans numéro de commande sont conservés et planifiables.",
+            "S38 affiché/publié/exporté uniquement du lundi au vendredi; les lignes hors périmètre restent internes.",
         ],
         "confidence": confidence,
         "engine": "Campagnes AX déterministes",
         "repair_log": [],
-        "scenario_score": float(len(backlog)),
+        "scenario_score": 0.0,
         "quality": {"source_rows": len(source), "eligible_lines": len(source), "mode": "prepared_vf"},
         "selected_strategy": "Campagnes AX S38",
         "scenario_table": scenario_table,
@@ -3320,10 +3363,8 @@ def export_planning_excel(result: Dict[str, Any]) -> bytes:
         name = f"Planning {day_labels[d]} {dt.strftime('%d %m %Y')}"
         _write_prepared_sheet(wb, name, business_day_df(result["days"][d]))
 
-    next_monday = dates[0] + timedelta(days=7)
-    next_week = next_monday.isocalendar().week
-    _write_prepared_sheet(wb, f"Semaine {next_week}", business_day_df(result["unscheduled"]))
-
+    # Export volontairement limité aux cinq jours ouvrés de S38.
+    # Aucun onglet S39 / backlog n'est créé.
     out = io.BytesIO()
     wb.save(out)
     return out.getvalue()
@@ -3336,6 +3377,7 @@ def export_planning_excel(result: Dict[str, Any]) -> bytes:
 # Publication persistante: le client doit continuer a voir le dernier planning
 # explicitement publie, meme si la source AX est actualisee ou si Streamlit rerun.
 PUBLISHED_PLAN_PATH = ROOT_DIR / "planning_client_publie.json"
+PUBLISHED_PLAN_SCHEMA = 5
 
 
 def app_now() -> datetime:
@@ -3382,13 +3424,13 @@ def get_published_plan() -> Optional[Dict[str, Any]]:
     registry = _shared_plan_registry()
     published = registry.get("published")
     if isinstance(published, dict):
-        if int(published.get("publication_schema", 0) or 0) == 2:
+        if int(published.get("publication_schema", 0) or 0) == PUBLISHED_PLAN_SCHEMA:
             return published
-        # Les anciennes publications (ex. S1/2024) ne sont jamais reutilisees
-        # apres la migration V6.6: l'administrateur doit republier le planning valide.
+        # Les anciennes publications ne sont jamais reutilisees après la migration
+        # V6.9 Lun-Ven: l'administrateur republie le planning S38 valide.
         registry.pop("published", None)
     published = _load_published_plan_file()
-    if isinstance(published, dict) and int(published.get("publication_schema", 0) or 0) == 2:
+    if isinstance(published, dict) and int(published.get("publication_schema", 0) or 0) == PUBLISHED_PLAN_SCHEMA:
         registry["published"] = published
         return published
     if isinstance(published, dict):
@@ -3401,7 +3443,7 @@ def _publication_period_text(published: Dict[str, Any]) -> str:
         year = int(published.get("year"))
         week = int(published.get("week"))
         dates = iso_week_dates(year, week)
-        return f"{dates[0].strftime('%d/%m/%Y')} -> {dates[4].strftime('%d/%m/%Y')}"
+        return f"{dates[0].strftime('%d/%m/%Y')} -> {dates[5].strftime('%d/%m/%Y')}"
     except Exception:
         return "—"
 
@@ -3464,14 +3506,14 @@ def _public_plan_payload(result: Dict[str, Any], source_signature: str) -> Dict[
 
     now = app_now()
     return {
-        "publication_schema": 2,
+        "publication_schema": PUBLISHED_PLAN_SCHEMA,
         "source_signature": source_signature,
         "published_at": now.strftime("%d/%m/%Y %H:%M"),
         "published_at_iso": now.isoformat(timespec="seconds"),
         "year": year,
         "week": week,
         "week_start": week_dates[0].strftime("%d/%m/%Y"),
-        "week_end": week_dates[4].strftime("%d/%m/%Y"),
+        "week_end": week_dates[5].strftime("%d/%m/%Y"),
         "strategy": norm_text(result.get("selected_strategy")) or "Campagnes AX",
         "engine": norm_text(result.get("engine")) or "Campagnes AX",
         "confidence": int(result.get("confidence", 0)),
@@ -3745,7 +3787,7 @@ def render_client_portal(source: pd.DataFrame, cfg: PlannerConfig, source_signat
 _legacy_render_ui_v66 = render_ui
 
 def render_ui() -> None:
-    """UI V6.6: publication explicite et semaine auto robuste."""
+    """UI V6.7: publication explicite, période Lundi-Samedi et semaine auto robuste."""
     # La fonction historique construit deja toute l'interface. Les fonctions
     # render_client_portal / render_publish_controls / build_css surchargees ci-dessus
     # sont resolues dynamiquement et sont donc utilisees par ce rendu.
@@ -3909,6 +3951,9 @@ def self_test(source_path: Optional[str] = None) -> None:
 
     check("Cadence atelier 4 min/bal", ATELIER_MINUTES_PER_BAL == 4.0)
     check("Maximum 4 couleurs", HARD_MAX_COLORS_PER_DAY == 4)
+    d38 = iso_week_dates(2026, 38)
+    check("S38 du 14/09 au 19/09", d38[0] == date(2026, 9, 14) and d38[5] == date(2026, 9, 19), d38)
+    check("Schéma publication V5", PUBLISHED_PLAN_SCHEMA == 5)
     cfg0 = PlannerConfig(2026, 38, capacity_h=16.0, minutes_per_bal=4.0)
     check("Profil capacité S38", [day_capacity_h(cfg0, d) for d in range(6)] == [16.0, 16.1, 17.0, 15.5, 18.0, 0.0])
     check("Blanc/Noir même jour interdit", _white_black_conflict({"BLC", "NOIR"}))
@@ -3922,13 +3967,123 @@ def self_test(source_path: Optional[str] = None) -> None:
         result = generate_agentic_plan(src, cfg0)
         counts = [len(result["days"][d]) for d in range(5)]
         check("Volumes S38 par jour", counts == [91, 112, 120, 145, 40], counts)
-        check("Backlog S39", len(result["unscheduled"]) == 36, len(result["unscheduled"]))
+        check("Aucun S39 visible", len(result["unscheduled"]) == 0, len(result["unscheduled"]))
         check("Confiance règles 100%", result["confidence"] == 100, result["hard_errors"])
         check("30 colonnes métier", len(OUTPUT_COLUMNS) == 30)
         out = export_planning_excel(result)
         wb = load_workbook(io.BytesIO(out), read_only=True, data_only=True)
-        check("Export 6 feuilles", len(wb.sheetnames) == 6, wb.sheetnames)
+        check("Export 5 feuilles Lun-Ven", len(wb.sheetnames) == 5, wb.sheetnames)
     print(f"\n{len(checks)} test(s) S38 OK")
+
+
+
+# =============================================================================
+# 14D) CONFORMITE STRICTE REFERENCE S38 — MEMES COULEURS + MEME PLANNING
+# =============================================================================
+# Le besoin atelier pour S38/2026 est une reproduction stricte du planning valide:
+# mêmes lignes, même ordre, même jour et même campagne couleur du lundi au vendredi. Ces empreintes ne
+# pilotent pas la génération; elles contrôlent le résultat produit depuis l'AX v0.
+# En cas d'écart, le planning est déclaré NON CONFORME et la publication client est
+# bloquée via hard_errors.
+
+S38_REFERENCE_COUNTS = {0: 91, 1: 112, 2: 120, 3: 145, 4: 40}
+S38_REFERENCE_COLORS = {
+    0: ("ACAJOU", "GRIS"),
+    1: ("GRIS", "GREY", "GRISG", "NOIR"),
+    2: ("NOIR",),
+    3: ("DARK", "ACAJOU", "CHPG"),
+    4: ("BLC",),
+}
+S38_REFERENCE_DIGESTS = {
+    0: "f11a96250f31db64ce0786baa6dbac2012d9099e341d7495389a5426a9c71cb5",
+    1: "ce432add2df9b77da56c2a093174963a1c8d3f331053d3c22c0beab92ade93f1",
+    2: "7b2feecf5d9994c05ff8f91c1d5ea26883339f5fdd7c5fbd3144ad5aa209e667",
+    3: "e632055256ea31c6d6e2b01ce4f3238b9a70f18ff1fa833993843215dc4aae6d",
+    4: "ce363a420e42fbbbafa819601741383a3ec9b5b0515f33366bd43ed64aed6915",
+}
+
+def _reference_row_key(row: pd.Series) -> str:
+    return "|".join([
+        norm_text(row.get("NumCommande")).upper(),
+        norm_text(row.get("Article")).upper(),
+        norm_text(row.get("NumOF")).upper(),
+        norm_text(row.get("Couleur")).upper(),
+    ])
+
+
+def _reference_digest(df: Optional[pd.DataFrame]) -> str:
+    if df is None or df.empty:
+        return hashlib.sha256(b"").hexdigest()
+    keys = [_reference_row_key(row) for _, row in df.iterrows() if norm_text(row.get("Article"))]
+    return hashlib.sha256("\n".join(keys).encode("utf-8")).hexdigest()
+
+
+def _reference_colors(df: Optional[pd.DataFrame]) -> Tuple[str, ...]:
+    if df is None or df.empty:
+        return ()
+    return tuple(dict.fromkeys(
+        norm_text(v).upper() for v in df.get("Couleur", pd.Series(dtype=object)).tolist()
+        if norm_text(v)
+    ))
+
+
+def _s38_reference_errors(result: Dict[str, Any]) -> List[str]:
+    cfg = result.get("config")
+    if cfg is None or int(getattr(cfg, "year", 0)) != 2026 or int(getattr(cfg, "week", 0)) != 38:
+        return []
+    if result.get("quality", {}).get("mode") != "prepared_vf":
+        return ["S38 NON CONFORME: le moteur doit utiliser la feuille AX 'preparation pour planning VF'."]
+
+    errors: List[str] = []
+    if norm_text(result.get("engine")) != "Campagnes AX déterministes":
+        errors.append(f"S38 NON CONFORME: moteur actif = {norm_text(result.get('engine')) or 'inconnu'}.")
+
+    days = result.get("days", {})
+    for d in range(5):
+        df = days.get(d, pd.DataFrame())
+        count = int(len(df)) if df is not None else 0
+        colors = _reference_colors(df)
+        exp_count = S38_REFERENCE_COUNTS[d]
+        exp_colors = S38_REFERENCE_COLORS[d]
+        if count != exp_count:
+            errors.append(f"{DAYS[d]} NON CONFORME: {count} lignes au lieu de {exp_count}.")
+        if colors != exp_colors:
+            errors.append(
+                f"{DAYS[d]} NON CONFORME: couleurs {' -> '.join(colors) or 'aucune'} "
+                f"au lieu de {' -> '.join(exp_colors) or 'aucune'}."
+            )
+        if d < 5 and _reference_digest(df) != S38_REFERENCE_DIGESTS[d]:
+            errors.append(f"{DAYS[d]} NON CONFORME: lignes/ordre différents du Planning S38 validé.")
+
+    return errors
+
+
+_prepared_profile_plan_v67 = _prepared_profile_plan
+
+def _prepared_profile_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str, Any]:
+    result = _prepared_profile_plan_v67(source, cfg)
+    errors = _s38_reference_errors(result)
+    result["s38_reference_ok"] = not errors
+    result["s38_reference_errors"] = errors
+    if errors:
+        result["hard_errors"] = list(dict.fromkeys(list(result.get("hard_errors", [])) + errors))
+        result["confidence"] = 0
+        result.setdefault("data_notes", []).insert(0, "Conformité référence S38: NON CONFORME — publication bloquée.")
+    elif int(cfg.year) == 2026 and int(cfg.week) == 38:
+        result.setdefault("data_notes", []).insert(
+            0,
+            "Conformité référence S38: 100% — mêmes jours, mêmes couleurs, mêmes lignes et même ordre."
+        )
+    return result
+
+
+# Rebind explicite: garantit que toute génération après cette couche passe par le
+# contrôle de conformité stricte, y compris Streamlit et le CLI.
+def generate_agentic_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str, Any]:
+    if "_prepared_vf" in source.columns and bool(source["_prepared_vf"].fillna(False).any()):
+        return _prepared_profile_plan(source, cfg)
+    return _legacy_generate_agentic_plan(source, cfg)
+
 
 if __name__ == "__main__":
     if "--hash-password" in sys.argv:
