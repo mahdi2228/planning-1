@@ -4933,27 +4933,11 @@ def render_ui() -> None:
 
     source_name=_active_source_name(); source_sheet=source.attrs.get("source_sheet","—")
 
-    # Source de vérité de la période:
-    # - résultat courant de la même Base si présent;
-    # - sinon prochaine semaine strictement après la dernière publication chargée;
-    # - sinon prochaine semaine strictement après aujourd'hui.
-    existing_result=st.session_state.get("plan_result")
-    existing_source_ok=bool(existing_result) and st.session_state.get("plan_source_signature")==file_signature
-    if existing_source_ok:
-        existing_cfg=existing_result.get("config")
-        cfg=_auto_cfg(source,app_today())
-        if existing_cfg is not None:
-            cfg=dc_replace(cfg,year=int(existing_cfg.year),week=int(existing_cfg.week))
-    else:
-        published=get_published_plan()
-        if published:
-            try:
-                published_start=date.fromisocalendar(int(published.get("year")),int(published.get("week")),1)
-                cfg=_auto_cfg(source,published_start)
-            except Exception:
-                cfg=_auto_cfg(source,app_today())
-        else:
-            cfg=_auto_cfg(source,app_today())
+    # Source de vérité unique de la période: la date du jour de l'application.
+    # Tant que la date du jour ne change pas, toutes les régénérations restent
+    # sur la même semaine automatique. Exemple: 30/09/2026 -> S41, même après
+    # plusieurs clics sur Régénérer.
+    cfg=_auto_cfg(source,app_today())
 
     def _plan_signature(plan_cfg: PlannerConfig) -> str:
         return f"{VERSION}|{file_signature}|{plan_cfg.year}|{plan_cfg.week}"
@@ -4975,22 +4959,17 @@ def render_ui() -> None:
         with c1:
             st.markdown(f"<div class='card'><b>Source active</b><br><span class='subtitle'>{_esc(source_name)}</span><br><span class='subtitle'>{_esc(source_sheet)} · {format_num(len(source))} lignes</span></div>",unsafe_allow_html=True)
         with c2:
-            regen=st.button("Régénérer la semaine suivante",use_container_width=True,type="primary")
+            regen=st.button("Régénérer",use_container_width=True,type="primary")
         with c3:
             period_start=date.fromisocalendar(int(cfg.year),int(cfg.week),1); period_end=period_start+timedelta(days=4)
             st.markdown(f"<div class='card'><b>Période automatique</b><br><span class='subtitle'>S{cfg.week}/{cfg.year}</span><br><span class='subtitle'>{period_start.strftime('%d/%m/%Y')} → {period_end.strftime('%d/%m/%Y')}</span></div>",unsafe_allow_html=True)
 
         if regen:
             try:
-                current=st.session_state.get("plan_result") if st.session_state.get("plan_source_signature")==file_signature else None
-                if current and current.get("config") is not None:
-                    current_cfg=current["config"]
-                    reference=date.fromisocalendar(int(current_cfg.year),int(current_cfg.week),1)
-                else:
-                    reference=app_today()
-                next_year,next_week=automatic_planning_week(reference)
-                next_cfg=dc_replace(cfg,year=next_year,week=next_week)
-                ensure_plan(True,next_cfg)
+                # Régénérer force un nouveau calcul, mais toujours pour la période
+                # déterminée par la date du jour. Le clic ne fait jamais avancer
+                # artificiellement de S41 vers S42/S43.
+                ensure_plan(True,cfg)
                 st.rerun()
             except Exception as exc:
                 st.error(f"Le planning n'a pas été généré. Référence: {safe_error_id(exc)}")
