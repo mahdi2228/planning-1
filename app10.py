@@ -78,7 +78,8 @@ except Exception:
 # 1. CONFIGURATION GÉNÉRALE
 # =============================================================================
 APP_NAME = "ALLUCO — Planning Laquage IA"
-APP_VERSION = "8.2.0-BENCHMARK-CORRECTED"
+APP_VERSION = "8.2.1-SESSION-HOTFIX"
+RESULT_SCHEMA_VERSION = 2
 APP_TIMEZONE = "Africa/Tunis"
 ROOT_DIR = Path(__file__).resolve().parent
 DB_PATH = ROOT_DIR / "alluco_runtime.db"
@@ -1460,12 +1461,78 @@ def generate_agentic_plan(source: pd.DataFrame, cfg: PlannerConfig, master: Opti
         "audit": audit, "steps": steps, "pack_decisions": pack_decisions,
         "validation_pct": constraint_validation, "constraint_validation_pct": constraint_validation,
         **quality, "elapsed_s": round(time.perf_counter() - t0, 3),
+        "_result_schema_version": RESULT_SCHEMA_VERSION,
     }
 
 
 # =============================================================================
 # 9. EXPLICATIONS
 # =============================================================================
+def ensure_result_schema(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Backfill/migre les résultats conservés en session par une ancienne version.
+
+    Streamlit peut garder ``st.session_state`` lors d'un hot-reload ou d'un
+    redéploiement. Cette fonction évite qu'une nouvelle UI casse sur un résultat
+    calculé par une version précédente du moteur. Elle ne modifie pas les décisions
+    métier; elle complète uniquement les métadonnées/KPI manquants.
+    """
+    if not isinstance(result, dict):
+        raise TypeError("Résultat planning invalide: dictionnaire attendu.")
+
+    result.setdefault("hard_errors", [])
+    result.setdefault("warnings", [])
+    result.setdefault("steps", [])
+    result.setdefault("pack_decisions", [])
+    result.setdefault("excluded", pd.DataFrame())
+    result.setdefault("audit", pd.DataFrame())
+    result.setdefault("backlog", pd.DataFrame())
+    result.setdefault("report", pd.DataFrame())
+
+    # Anciennes versions utilisaient seulement ``validation_pct``.
+    if "constraint_validation_pct" not in result:
+        if "validation_pct" in result:
+            result["constraint_validation_pct"] = result.get("validation_pct", 0)
+        else:
+            hard = result.get("hard_errors") or []
+            result["constraint_validation_pct"] = 100 if not hard else max(0, 100 - len(hard) * 25)
+    result.setdefault("validation_pct", result["constraint_validation_pct"])
+
+    # Reconstituer les KPI qualité si les données du résultat le permettent.
+    quality_keys = {"data_quality_pct", "reference_coverage_pct", "of_coverage_pct", "ready_lines", "plannable_lines"}
+    if not quality_keys.issubset(result):
+        prepared = result.get("prepared")
+        days = result.get("days")
+        if isinstance(prepared, pd.DataFrame) and isinstance(days, dict):
+            try:
+                quality = _quality_kpis(prepared, days)
+            except Exception:
+                quality = {}
+        else:
+            quality = {}
+        result.setdefault("data_quality_pct", quality.get("data_quality_pct", 0.0))
+        result.setdefault("reference_coverage_pct", quality.get("reference_coverage_pct", 0.0))
+        result.setdefault("of_coverage_pct", quality.get("of_coverage_pct", 0.0))
+        result.setdefault("ready_lines", quality.get("ready_lines", 0))
+        result.setdefault("plannable_lines", quality.get("plannable_lines", 0))
+
+    result.setdefault("master_version", "ancienne-session")
+    result.setdefault("source_mode", "unknown")
+    result["_result_schema_version"] = RESULT_SCHEMA_VERSION
+    return result
+
+
+def _result_cache_signature(source: pd.DataFrame, cfg: PlannerConfig, master: ReferenceMaster) -> str:
+    """Signature de cache Streamlit: moteur + source + référentiel + paramètres."""
+    source_sha = norm_text(getattr(source, "attrs", {}).get("source_sha256"))
+    if not source_sha:
+        # Fallback déterministe pour les sources chargées par d'anciennes versions.
+        sample = source.head(200).to_json(date_format="iso", orient="split", default_handler=str)
+        source_sha = hashlib.sha256((str(len(source)) + "|" + sample).encode("utf-8")).hexdigest()
+    cfg_payload = json.dumps(cfg.__dict__, sort_keys=True, default=str, ensure_ascii=True)
+    raw = f"{APP_VERSION}|schema={RESULT_SCHEMA_VERSION}|{source_sha}|{master.version}|{cfg_payload}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def explanation_table(result: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     cfg: PlannerConfig = result["config"]
@@ -1513,6 +1580,7 @@ def _write_dataframe(ws, df: pd.DataFrame, header_fill: str = "163A5F", start_ro
 
 
 def export_planning_excel(result: Dict[str, Any]) -> bytes:
+    result = ensure_result_schema(result)
     cfg: PlannerConfig = result["config"]
     wb = Workbook(); wb.remove(wb.active)
     navy, blue, green, amber, red, white = "163A5F", "155EEF", "ECFDF3", "FFFAEB", "FEF3F2", "FFFFFF"
@@ -1584,6 +1652,7 @@ def export_planning_excel(result: Dict[str, Any]) -> bytes:
 
 
 def export_planning_pdf(result: Dict[str, Any]) -> bytes:
+    result = ensure_result_schema(result)
     if not REPORTLAB_AVAILABLE:
         raise RuntimeError("ReportLab indisponible")
     cfg: PlannerConfig = result["config"]
@@ -1614,6 +1683,7 @@ def export_planning_pdf(result: Dict[str, Any]) -> bytes:
 # 11. PUBLICATION CLIENT
 # =============================================================================
 def published_payload(result: Dict[str, Any], source_sig: str) -> Dict[str, Any]:
+    result = ensure_result_schema(result)
     cfg: PlannerConfig = result["config"]
     dates = planning_dates(cfg); labels = planning_labels(cfg)
     commands: Dict[str, Dict[str, Any]] = {}
@@ -1795,6 +1865,7 @@ def _config_ui(base: PlannerConfig) -> PlannerConfig:
 
 
 def _render_dashboard(result: Dict[str, Any]) -> None:
+    result = ensure_result_schema(result)
     m = result["metrics"]
     st.markdown("<div class='alluco-hero'><div class='alluco-title'>Planning automatique contrôlé</div><div class='alluco-sub'>Base AX → préparation métier → campagnes → capacité → audit → publication.</div></div>", unsafe_allow_html=True)
     cols = st.columns(6)
@@ -1909,7 +1980,10 @@ def render_ui() -> None:
 
     with st.sidebar:
         if st.button("Se déconnecter"):
-            st.session_state["admin_ok"] = False; st.rerun()
+            st.session_state["admin_ok"] = False
+            st.session_state.pop("last_result", None)
+            st.session_state.pop("last_result_signature", None)
+            st.rerun()
         st.divider()
         uploaded = st.file_uploader("Base AX / extraction v0", type=["xlsx"])
         if uploaded is not None:
@@ -1917,6 +1991,7 @@ def render_ui() -> None:
             if not active_data or sha256_bytes(data) != sha256_bytes(active_data):
                 blob_set("active_source", data); kv_set("active_source_name", uploaded.name)
                 st.session_state.pop("last_result", None)
+                st.session_state.pop("last_result_signature", None)
                 st.success("Base activée.")
                 active_data = data
                 source = load_source_workbook(data)
@@ -1946,15 +2021,32 @@ def render_ui() -> None:
     c1, c2 = st.columns([1, 4])
     with c1:
         generate = st.button("Générer / Régénérer", type="primary", use_container_width=True)
-    if generate or "last_result" not in st.session_state:
+
+    cache_signature = _result_cache_signature(source, cfg, master)
+    cached = st.session_state.get("last_result")
+    cached_signature = st.session_state.get("last_result_signature", "")
+    cached_schema = cached.get("_result_schema_version", 0) if isinstance(cached, dict) else 0
+    must_regenerate = (
+        generate
+        or not isinstance(cached, dict)
+        or cached_signature != cache_signature
+        or int(cached_schema or 0) != RESULT_SCHEMA_VERSION
+    )
+
+    if must_regenerate:
         with st.spinner("Agents: lecture → préparation → quantités → stock → campagnes → audit..."):
             try:
-                st.session_state["last_result"] = generate_agentic_plan(source, cfg, master)
+                fresh = generate_agentic_plan(source, cfg, master)
+                st.session_state["last_result"] = ensure_result_schema(fresh)
+                st.session_state["last_result_signature"] = cache_signature
             except Exception as exc:
                 st.error(f"Génération impossible: {exc}")
                 return
+    else:
+        # Migration de sécurité pour toute ancienne session encore présente.
+        st.session_state["last_result"] = ensure_result_schema(cached)
+
     result = st.session_state["last_result"]
-    # Si paramètres changent, recalcul explicite via le bouton, ce qui évite les reruns coûteux.
     _render_dashboard(result)
 
     st.divider()
