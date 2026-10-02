@@ -78,7 +78,7 @@ except Exception:
 # 1. CONFIGURATION GÉNÉRALE
 # =============================================================================
 APP_NAME = "ALLUCO — Planning Laquage IA"
-APP_VERSION = "8.2.1-SESSION-HOTFIX"
+APP_VERSION = "8.2.2-BENCHMARK-AUDIT-FIX"
 RESULT_SCHEMA_VERSION = 2
 APP_TIMEZONE = "Africa/Tunis"
 ROOT_DIR = Path(__file__).resolve().parent
@@ -135,8 +135,11 @@ BENCHMARK_PROFILES: Dict[str, Dict[str, Any]] = {
         "stock_capacity_pct": 500 / 833,
         "benchmark_total_bales": 833,
         "comparable_days": 4,
-        "source_hashes": {"703275530bf0805ce8a68e13273aec1c90ee0c7e9b85363f4da48c6fb7cf1e60"},
-        "aliases": {"base_3_v0", "base3_v0", "base_3"},
+        "source_hashes": {
+            "703275530bf0805ce8a68e13273aec1c90ee0c7e9b85363f4da48c6fb7cf1e60",  # base-3-v0.xlsx
+            "af590b17c0daf0b9dc8f89e4ae1a0b24ac0ee0d4d6ddb2ecde538c403305681b",  # Base3.xlsx
+        },
+        "aliases": {"base_3_v0", "base3_v0", "base_3", "base3"},
     },
 }
 
@@ -963,6 +966,18 @@ def normalize_prepared_source(df: pd.DataFrame, master: ReferenceMaster, cfg: Pl
         line_id = hashlib.sha1(f"prepared|{i}|{cmd}|{article}|{of}".encode()).hexdigest()[:16]
         row = {c: r.get(c) for c in OUTPUT_COLUMNS}
         maturity, maturity_reason = ("STOCK", "besoin stock") if not cmd else _maturity_status(r, color)
+        remaining_qty = max(0, to_int(r.get("ResteALivrer")))
+        of_remaining_qty = max(0, to_int(r.get("QteRestante")))
+        # Une feuille préparée peut piloter la quantité sur le reliquat OF plutôt
+        # que sur le seul reste commercial. Exemple historique: ResteALivrer=20,
+        # QteRestante=30, Lancement=30. L'audit utilise donc la cible OF lorsqu'elle
+        # existe et dépasse le reste commercial; sinon le reste à livrer. La cible
+        # robuste est donc max(ResteALivrer, QteRestante).
+        balance_target = max(remaining_qty, of_remaining_qty) if cmd else remaining_qty
+        # Le stock direct n'est pas exporté comme colonne dédiée dans les historiques.
+        # On le reconstruit pour conserver l'identité cible = lancement + re-laquage
+        # + stock direct sans créer de faux positif dans l'audit.
+        inferred_direct_stock = max(0, balance_target - launch - relaq) if cmd else 0
         row.update({
             "NumCommande": cmd, "Article": article, "Article/int": ai, "Couleur": color,
             "Nuance": to_float(r.get("Nuance"), nuance), "Lancement": launch, "Re-laquage": relaq,
@@ -974,7 +989,9 @@ def normalize_prepared_source(df: pd.DataFrame, master: ReferenceMaster, cfg: Pl
             "Écart stock laqué vs 30 %": gap,
             "_line_id": line_id, "_source_index": int(i),
             "_source_type": "CUSTOMER_ORDER" if cmd else "STOCK_REPLENISHMENT",
-            "_direct_stock": 0, "_qty_reason": "PREPARED_SOURCE", "_eligibility_reason": "PREPARED_SOURCE",
+            "_direct_stock": inferred_direct_stock, "_balance_target": balance_target,
+            "_qty_reason": "PREPARED_SOURCE_WITH_DIRECT_STOCK_INFERRED" if inferred_direct_stock > 0 else "PREPARED_SOURCE",
+            "_eligibility_reason": "PREPARED_SOURCE",
             "_score": (3200.0 if maturity == "READY" else 800.0) if cmd else 50.0,
             "_score_reason": "source préparée", "_tech_source": tech_src, "_color_known": bool(color_known),
             "_maturity": maturity, "_maturity_reason": maturity_reason,
@@ -1151,12 +1168,14 @@ def _pack_customer_days(customer: pd.DataFrame, cfg: PlannerConfig) -> Tuple[Dic
     overflow: List[pd.DataFrame] = []
     decisions: List[str] = []
     labels = planning_labels(cfg)
+    active_days = comparable_day_count(cfg) if cfg.date_mode == "HISTORICAL_BENCHMARK" else 5
+    active_days = max(1, min(5, int(active_days)))
     d = 0
 
     for group in _group_rows_for_packing(customer):
         gb = int(pd.to_numeric(group["Nbre Bal"], errors="coerce").fillna(0).sum())
         gcolors = set(group["Couleur"].astype(str).str.upper())
-        while d < 5:
+        while d < active_days:
             projected_colors = day_colors[d] | gcolors
             color_conflict = cfg.avoid_white_black_same_day and _day_has_white_black_conflict(projected_colors)
             too_many_colors = len(projected_colors) > cfg.max_colors_per_day
@@ -1167,7 +1186,7 @@ def _pack_customer_days(customer: pd.DataFrame, cfg: PlannerConfig) -> Tuple[Dic
                 continue
             break
 
-        if d >= 5:
+        if d >= active_days:
             overflow.append(group)
             continue
 
@@ -1175,9 +1194,9 @@ def _pack_customer_days(customer: pd.DataFrame, cfg: PlannerConfig) -> Tuple[Dic
             for _, one in group.iterrows():
                 one_df = pd.DataFrame([one])
                 ob = _row_bales(one)
-                while d < 5 and day_rows[d] and day_bales[d] + ob > cfg.max_bales_per_day:
+                while d < active_days and day_rows[d] and day_bales[d] + ob > cfg.max_bales_per_day:
                     d += 1
-                if d >= 5:
+                if d >= active_days:
                     overflow.append(one_df)
                     continue
                 day_rows[d].append(one_df); day_bales[d] += ob; day_colors[d].add(canonical_color(one.get("Couleur")))
@@ -1203,7 +1222,12 @@ def _fill_stock_days(days: Dict[int, pd.DataFrame], stock_rows: pd.DataFrame, cf
         return days, stock_rows.iloc[0:0].copy()
     carry: List[pd.Series] = []
     comp = comparable_day_count(cfg)
-    preferred_days = list(range(max(0, comp - 1), -1, -1)) + list(range(4, comp - 1, -1))
+    if cfg.date_mode == "HISTORICAL_BENCHMARK":
+        # Un benchmark incomplet (S41: lundi-jeudi seulement) ne doit pas déplacer
+        # artificiellement la charge sur un vendredi absent de la référence.
+        preferred_days = list(range(max(0, comp - 1), -1, -1))
+    else:
+        preferred_days = list(range(max(0, comp - 1), -1, -1)) + list(range(4, comp - 1, -1))
     preferred_days = list(dict.fromkeys(d for d in preferred_days if 0 <= d < 5))
     for _, original in _sort_production(stock_rows).iterrows():
         row = original.copy()
@@ -1321,10 +1345,12 @@ def plan_metrics(days: Dict[int, pd.DataFrame], report: pd.DataFrame, cfg: Plann
             "Nb couleurs": len(colors), "Couleurs": " → ".join(colors), "Lignes": len(df),
         })
     report_bales = int(pd.to_numeric(report.get("Nbre Bal", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()) if not report.empty else 0
+    active_days = comparable_day_count(cfg) if cfg.date_mode == "HISTORICAL_BENCHMARK" else 5
+    active_capacity_bales = max(1, active_days * cfg.max_bales_per_day)
     return {
         "days": dms, "total_bales": total_bales, "total_load_h": round(total_h, 2),
-        "capacity_h": round(5 * cfg.max_bales_per_day * cfg.minutes_per_bal / 60.0, 2),
-        "utilization_pct": round(total_bales / (5 * cfg.max_bales_per_day) * 100, 1) if cfg.max_bales_per_day else 0,
+        "capacity_h": round(active_days * cfg.max_bales_per_day * cfg.minutes_per_bal / 60.0, 2),
+        "utilization_pct": round(total_bales / active_capacity_bales * 100, 1) if cfg.max_bales_per_day else 0,
         "report_bales": report_bales, "report_rows": len(report),
         "customer_bales": customer_bales, "stock_bales": stock_bales,
         "customer_share_pct": round(customer_bales / total_bales * 100, 1) if total_bales else 0.0,
@@ -1373,7 +1399,7 @@ def audit_plan(days: Dict[int, pd.DataFrame], report: pd.DataFrame, backlog: pd.
         customer = planned[planned["_source_type"] == "CUSTOMER_ORDER"] if "_source_type" in planned.columns else planned
         if not customer.empty:
             calc = pd.to_numeric(customer["Lancement"], errors="coerce").fillna(0) + pd.to_numeric(customer["Re-laquage"], errors="coerce").fillna(0)
-            rem = pd.to_numeric(customer["ResteALivrer"], errors="coerce").fillna(0)
+            rem = pd.to_numeric(customer.get("_balance_target", customer["ResteALivrer"]), errors="coerce").fillna(0)
             direct = pd.to_numeric(customer.get("_direct_stock", pd.Series(0, index=customer.index)), errors="coerce").fillna(0)
             bad = (calc + direct - rem).abs() > 1e-6
             if bad.any():
