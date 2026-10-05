@@ -85,7 +85,7 @@ except Exception:  # PDF reste optionnel si ReportLab n'est pas installé
 # =============================================================================
 # 1) CONFIGURATION
 # =============================================================================
-VERSION = "6.2.0"
+VERSION = "8.0.0"
 APP_NAME = "ALLUCO — Planning Laquage IA"
 APP_SUBTITLE = "Agentic AI · Planning industriel · Portail Client"
 ROOT_DIR = Path(__file__).resolve().parent
@@ -2650,6 +2650,297 @@ def render_client_portal(source: pd.DataFrame, cfg: PlannerConfig, source_signat
         st.caption("Export PDF client indisponible: installez reportlab pour l'activer.")
 
 
+
+# =============================================================================
+# V8 — FLUX EN 2 ETAPES STRICTEMENT SEPAREES
+#   1) fichier brut -> remplissage Lancement / Re-laquage -> fichier prepare
+#   2) fichier prepare -> planning (sans recalculer Lancement / Re-laquage)
+# =============================================================================
+def _lr_header_map(ws) -> Dict[str, int]:
+    """Retourne {cle_normalisee: numero_colonne} pour la ligne d'en-tete 1."""
+    out: Dict[str, int] = {}
+    for cell in ws[1]:
+        key = norm_key(cell.value)
+        canonical_key = norm_key(_canonical_header(cell.value))
+        if key and key not in out:
+            out[key] = int(cell.column)
+        if canonical_key and canonical_key not in out:
+            out[canonical_key] = int(cell.column)
+    return out
+
+
+def _choose_lr_sheet(wb) -> Optional[Any]:
+    """Feuille contenant les donnees necessaires au calcul Lancement/Re-laquage."""
+    preferred = ("feuil1", "extraction_ax", "version_0", "preparation_pour_planning_vf")
+    keyed = {norm_key(ws.title): ws for ws in wb.worksheets}
+    ordered = [keyed[k] for k in preferred if k in keyed]
+    ordered.extend(ws for ws in wb.worksheets if ws not in ordered)
+    for ws in ordered:
+        h = _lr_header_map(ws)
+        if "article" in h and "restealivrer" in h and "stockphysique" in h:
+            return ws
+    return None
+
+
+def _get_lr_cell_value(ws, row: int, h: Dict[str, int], *keys: str) -> Any:
+    for key in keys:
+        col = h.get(norm_key(key))
+        if col:
+            return ws.cell(row, col).value
+    return None
+
+
+def prepare_lancement_relaquage_excel(data: bytes) -> Tuple[bytes, pd.DataFrame, Dict[str, Any]]:
+    """Etape 1: conserve le classeur d'origine et remplit uniquement Lancement/Re-laquage.
+
+    Les valeurs sont ecrites en dur (pas de formules), afin que le fichier telecharge
+    puisse etre re-uploade immediatement dans l'etape Planning, sans devoir l'ouvrir
+    et le recalculer dans Excel.
+    """
+    from copy import copy as _copy
+    from openpyxl.comments import Comment
+    wb = load_workbook(io.BytesIO(data), data_only=False)
+    ws = _choose_lr_sheet(wb)
+    if ws is None:
+        raise ValueError("Aucune feuille compatible: Article, ResteALivrer et StockPhysique sont requis.")
+
+    h = _lr_header_map(ws)
+    # Ajoute les deux colonnes si elles n'existent pas, sinon conserve leur emplacement.
+    launch_col = h.get("lancement")
+    relaq_col = h.get("re_laquage") or h.get("relaquage")
+    last_col = max((c.column for c in ws[1] if c.value is not None), default=ws.max_column)
+
+    if launch_col is None:
+        launch_col = last_col + 1
+        ws.cell(1, launch_col, "Lancement")
+        last_col = launch_col
+    if relaq_col is None:
+        relaq_col = last_col + 1
+        ws.cell(1, relaq_col, "Re-laquage")
+
+    # Copie le style de l'en-tete voisin si les colonnes viennent d'etre ajoutees.
+    ref_header_col = max(1, min(launch_col, relaq_col) - 1)
+    for col in (launch_col, relaq_col):
+        if ws.cell(1, ref_header_col).has_style:
+            ws.cell(1, col)._style = _copy(ws.cell(1, ref_header_col)._style)
+            ws.cell(1, col).font = _copy(ws.cell(1, ref_header_col).font)
+            ws.cell(1, col).fill = _copy(ws.cell(1, ref_header_col).fill)
+            ws.cell(1, col).border = _copy(ws.cell(1, ref_header_col).border)
+            ws.cell(1, col).alignment = _copy(ws.cell(1, ref_header_col).alignment)
+
+    # Recalcule la map apres ajout.
+    h = _lr_header_map(ws)
+    group_occurrence: Counter = Counter()
+    preview_rows: List[Dict[str, Any]] = []
+    total_launch = 0
+    total_relaq = 0
+    relaq_lines_count = 0
+    filled = 0
+
+    blank_run = 0
+    seen = False
+    for r in range(2, ws.max_row + 1):
+        article = norm_text(_get_lr_cell_value(ws, r, h, "Article"))
+        cmd = norm_text(_get_lr_cell_value(ws, r, h, "NumCommande"))
+        if not article:
+            if seen:
+                blank_run += 1
+                if blank_run >= 180:
+                    break
+            continue
+        seen = True
+        blank_run = 0
+
+        art = norm_text(_get_lr_cell_value(ws, r, h, "Article/int", "Article_int"))
+        color = norm_text(_get_lr_cell_value(ws, r, h, "Couleur")).upper()
+        inferred_art, inferred_color = split_article(article)
+        if not art:
+            art = inferred_art
+        if not color:
+            color = inferred_color
+
+        group_key = (norm_text(art).upper(), norm_text(color).upper())
+        group_occurrence[group_key] += 1
+        first_in_group = group_occurrence[group_key] == 1
+
+        row_data = {
+            "ResteALivrer": _get_lr_cell_value(ws, r, h, "ResteALivrer"),
+            "Preleve": _get_lr_cell_value(ws, r, h, "Preleve", "Prelevé"),
+            "QteRestante": _get_lr_cell_value(ws, r, h, "QteRestante"),
+            "ReserverBR": _get_lr_cell_value(ws, r, h, "ReserverBR"),
+            "StockPhysique": _get_lr_cell_value(ws, r, h, "StockPhysique"),
+            "Reserver": _get_lr_cell_value(ws, r, h, "Reserver"),
+        }
+        launch, relaq, need, allocated = calculate_lancement_relaquage(
+            row_data, art, color, first_in_group=first_in_group
+        )
+
+        # Valeurs numeriques immediatement reutilisables par l'etape 2.
+        ws.cell(r, launch_col).value = int(launch)
+        ws.cell(r, relaq_col).value = int(relaq) if relaq > 0 else None
+        ws.cell(r, launch_col).number_format = "0"
+        ws.cell(r, relaq_col).number_format = "0"
+
+        # Si colonnes ajoutees, reprend le style de la colonne precedente ligne par ligne.
+        for col in (launch_col, relaq_col):
+            ref_col = max(1, col - 1)
+            if ws.cell(r, ref_col).has_style and not ws.cell(r, col).has_style:
+                ws.cell(r, col)._style = _copy(ws.cell(r, ref_col)._style)
+
+        total_launch += int(launch)
+        total_relaq += int(relaq)
+        if relaq > 0:
+            relaq_lines_count += 1
+        filled += 1
+        if len(preview_rows) < 200:
+            preview_rows.append({
+                "NumCommande": cmd,
+                "Article": article,
+                "Article/int": art,
+                "Couleur": color,
+                "Besoin": int(math.ceil(need - 1e-9)),
+                "StockPhysique": to_int(row_data.get("StockPhysique")),
+                "Lancement": int(launch),
+                "Re-laquage": int(relaq),
+            })
+
+    if filled == 0:
+        raise ValueError("Aucune ligne article n'a ete trouvee dans la feuille selectionnee.")
+
+    # Marqueur visible pour l'etape 2, sans ajouter de feuille ni changer la structure metier.
+    ws.cell(1, launch_col).comment = Comment(
+        "Calcule par l'etape 1 ALLUCO. Ce fichier est pret pour l'etape 2 Planning.",
+        "ALLUCO Planning IA",
+    )
+    ws.cell(1, relaq_col).comment = Comment(
+        "Calcule par l'etape 1 ALLUCO. Le planning doit reutiliser cette valeur sans la recalculer.",
+        "ALLUCO Planning IA",
+    )
+    try:
+        wb.calculation.calcMode = "auto"
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+    except Exception:
+        pass
+
+    out = io.BytesIO()
+    wb.save(out)
+    preview = pd.DataFrame(preview_rows)
+    info = {
+        "sheet": ws.title,
+        "rows": filled,
+        "total_lancement": total_launch,
+        "total_relaquage": total_relaq,
+        "relaquage_lines": int(relaq_lines_count),
+    }
+    return out.getvalue(), preview, info
+
+
+def validate_prepared_lr_workbook(data: bytes) -> Tuple[bool, str, str, int]:
+    """Valide qu'un fichier de l'etape 1 contient des Lancement deja calcules."""
+    # Mode normal: l'acces cellule par cellule est beaucoup plus rapide que sur un ReadOnlyWorksheet.
+    wb = load_workbook(io.BytesIO(data), read_only=False, data_only=True)
+    ws = _choose_lr_sheet(wb)
+    if ws is None:
+        return False, "Feuille metier introuvable.", "", 0
+    h = _lr_header_map(ws)
+    lc = h.get("lancement")
+    rc = h.get("re_laquage") or h.get("relaquage")
+    if lc is None or rc is None:
+        return False, "Colonnes Lancement / Re-laquage absentes. Passez d'abord par l'etape 1.", ws.title, 0
+
+    article_col = h.get("article")
+    total = 0
+    missing_launch = 0
+    for r in range(2, ws.max_row + 1):
+        article = norm_text(ws.cell(r, article_col).value) if article_col else ""
+        if not article:
+            continue
+        total += 1
+        v = ws.cell(r, lc).value
+        if not _lr_is_numeric(v):
+            missing_launch += 1
+    if total == 0:
+        return False, "Aucune ligne article trouvee.", ws.title, 0
+    if missing_launch:
+        return False, f"{missing_launch} ligne(s) ont Lancement vide/non calcule. Refaire l'etape 1.", ws.title, total
+    return True, "Fichier prepare valide.", ws.title, total
+
+
+def _strict_prepared_from_raw_lr(data: bytes, ws) -> pd.DataFrame:
+    """Transforme un RAW deja rempli L/R en structure planning SANS recalculer L/R."""
+    raw = _compact_raw_ax_df_full(ws)
+    # Les colonnes Lancement/Re-laquage peuvent avoir ete ajoutees au-dela des 21 colonnes AX.
+    h = _lr_header_map(ws)
+    lc = h.get("lancement")
+    rc = h.get("re_laquage") or h.get("relaquage")
+    if lc is None or rc is None:
+        raise ValueError("Lancement/Re-laquage absents.")
+
+    # Injecte explicitement les valeurs L/R dans le dataframe RAW en s'appuyant sur _raw_excel_row.
+    launch_vals = []
+    relaq_vals = []
+    for _, rr in raw.iterrows():
+        excel_row = int(rr.get("_raw_excel_row", 0) or 0)
+        launch_vals.append(ws.cell(excel_row, lc).value if excel_row else None)
+        relaq_vals.append(ws.cell(excel_row, rc).value if excel_row else None)
+    raw["Lancement"] = launch_vals
+    raw["Re-laquage"] = relaq_vals
+
+    # Genere les champs techniques/eligibilite, puis remet STRICTEMENT les quantites preparees.
+    legacy = _compact_raw_ax_df(ws)
+    raw_fp = _raw_base_fingerprint(legacy)
+    out = _generic_prepared_from_raw(raw, ws.title, raw_fp)
+    for i in out.index:
+        raw_pos = int(out.at[i, "_source_index"])
+        src = raw.iloc[raw_pos]
+        if not _lr_is_numeric(src.get("Lancement")):
+            raise ValueError(f"Lancement non calcule a la ligne source {int(src.get('_raw_excel_row', raw_pos + 2))}.")
+        launch = max(0, to_int(src.get("Lancement")))
+        relaq = max(0, to_int(src.get("Re-laquage"))) if _lr_is_numeric(src.get("Re-laquage")) else 0
+        out.at[i, "Lancement"] = launch
+        out.at[i, "Re-laquage"] = relaq if relaq > 0 else None
+
+        bars = max(0, to_int(out.at[i, "Barre/bal"]))
+        nbal = int(math.ceil(launch / bars - 1e-12)) if launch > 0 and bars > 0 else 0
+        cmd = norm_text(out.at[i, "NumCommande"]).upper()
+        article = norm_text(out.at[i, "Article"])
+        color = norm_text(out.at[i, "Couleur"]).upper()
+        art = norm_text(out.at[i, "Article/int"]).upper()
+        numof = norm_text(out.at[i, "NumOF"])
+        if (color, art, launch) in _ZERO_BAL_KEYS or (cmd, article, numof) in _ZERO_BAL_LINE_KEYS:
+            nbal = 0
+        out.at[i, "Nbre Bal"] = nbal
+        out.at[i, "tps"] = round(nbal * ATELIER_MINUTES_PER_BAL / 60.0, 12)
+        weight = max(0.0, to_float(out.at[i, "PoidsUn"], 0.0))
+        out.at[i, "PoidsT"] = round((launch + relaq) * weight, 3) if weight > 0 else 0.0
+        out.at[i, "Poudre"] = round(to_float(out.at[i, "PoidsT"]) * DEFAULT_POWDER_COEFF, 3) if weight > 0 else 0.0
+
+    out.attrs["source_mode"] = "prepared_lr_strict"
+    out.attrs["source_sheet"] = ws.title
+    return out
+
+
+def load_planning_source_workbook(data: bytes) -> pd.DataFrame:
+    """Etape 2: charge seulement un fichier deja prepare; ne recalcule jamais L/R."""
+    ok, msg, _sheet, _rows = validate_prepared_lr_workbook(data)
+    if not ok:
+        raise ValueError(msg)
+
+    wb = load_workbook(io.BytesIO(data), read_only=False, data_only=True)
+    # Si c'est deja une feuille finale complete, le normaliseur historique conserve
+    # les valeurs L/R puisqu'elles ont ete validees comme numeriques.
+    try:
+        ws_final, _mode = _choose_final_sheet(wb)
+        return _v7_final_load_source_workbook(data)
+    except Exception:
+        pass
+
+    ws = _choose_lr_sheet(wb)
+    if ws is None:
+        raise ValueError("Feuille preparee introuvable.")
+    return _strict_prepared_from_raw_lr(data, ws)
+
 def render_ui() -> None:
     if st is None:
         raise RuntimeError("Streamlit n'est pas installé. Lancez: pip install -r requirements.txt")
@@ -5008,7 +5299,7 @@ def render_ui() -> None:
         if not ACTIVE_SOURCE_PATH.is_file():
             cfg=_auto_cfg(pd.DataFrame(),app_today()); _top("Suivi de commande","Aucune base active n'a encore été chargée par l'administrateur.",cfg); st.info("Le portail sera disponible après chargement d'une Base Excel par l'administrateur."); return
         try:
-            data=ACTIVE_SOURCE_PATH.read_bytes(); source=load_source_workbook(data); cfg=_auto_cfg(source,app_today()); sig=_bytes_signature(data); render_client_portal(source,cfg,sig)
+            data=ACTIVE_SOURCE_PATH.read_bytes(); source=load_planning_source_workbook(data); cfg=_auto_cfg(source,app_today()); sig=_bytes_signature(data); render_client_portal(source,cfg,sig)
         except Exception as exc: st.error(f"Source indisponible. Référence: {safe_error_id(exc)}")
         return
 
@@ -5019,25 +5310,84 @@ def render_ui() -> None:
             st.session_state.pop("plan_result",None); st.session_state.pop("plan_signature",None); st.session_state.pop("plan_source_signature",None)
             st.rerun()
         st.divider()
-        nav=st.radio("Navigation admin",["🤖 Planning IA","🧠 Analyse IA"],label_visibility="collapsed")
+        nav=st.radio(
+            "Navigation admin",
+            ["1️⃣ Lancement / Re-laquage", "2️⃣ Planning IA", "🧠 Analyse IA"],
+            label_visibility="collapsed",
+        )
         st.divider()
-        uploaded=st.file_uploader("Base Excel",type=["xlsx"],help="Seul input requis: Base 1, Base 2 ou une nouvelle Base finale.")
-        if uploaded is not None:
-            incoming=uploaded.getvalue(); incoming_sig=_bytes_signature(incoming)
-            current_sig=_bytes_signature(ACTIVE_SOURCE_PATH.read_bytes()) if ACTIVE_SOURCE_PATH.is_file() else ""
-            if incoming_sig!=current_sig:
-                _save_active_source(incoming,uploaded.name)
-                st.session_state.pop("plan_result",None); st.session_state.pop("plan_signature",None); st.session_state.pop("plan_source_signature",None)
-                st.success("Base activée automatiquement.")
+        if nav != "1️⃣ Lancement / Re-laquage":
+            uploaded=st.file_uploader(
+                "Fichier préparé",
+                type=["xlsx"],
+                key="planning_prepared_upload",
+                help="Etape 2: chargez le fichier sorti de l'etape 1, avec Lancement et Re-laquage deja remplis.",
+            )
+            if uploaded is not None:
+                incoming=uploaded.getvalue()
+                ok,msg,prepared_sheet,prepared_rows=validate_prepared_lr_workbook(incoming)
+                if not ok:
+                    st.error(msg)
+                else:
+                    incoming_sig=_bytes_signature(incoming)
+                    current_sig=_bytes_signature(ACTIVE_SOURCE_PATH.read_bytes()) if ACTIVE_SOURCE_PATH.is_file() else ""
+                    if incoming_sig!=current_sig:
+                        _save_active_source(incoming,uploaded.name)
+                        st.session_state.pop("plan_result",None); st.session_state.pop("plan_signature",None); st.session_state.pop("plan_source_signature",None)
+                        st.success(f"Fichier préparé activé · {prepared_rows} lignes · {prepared_sheet}.")
         st.markdown("<span class='private-badge'>Mode prive administrateur</span>",unsafe_allow_html=True)
 
+    # ETAPE 1 totalement separee: aucun planning n'est genere ici.
+    if nav == "1️⃣ Lancement / Re-laquage":
+        prep_cfg=_auto_cfg(pd.DataFrame(),app_today())
+        _top("Préparation Lancement / Re-laquage","Etape 1 · fichier brut → fichier Excel préparé.",prep_cfg)
+        st.markdown("<div class='hero'><div class='hero-title'>1 · Préparer les quantités</div><div class='hero-sub'>Chargez le fichier brut. L'application remplit Lancement et Re-laquage puis vous rend le même classeur, prêt pour l'étape 2.</div></div>",unsafe_allow_html=True)
+        prep_upload=st.file_uploader("Fichier Excel brut",type=["xlsx"],key="lr_prepare_upload")
+        if prep_upload is None:
+            st.info("Chargez votre fichier brut pour obtenir la version préparée.")
+            return
+        incoming=prep_upload.getvalue(); prep_sig=_bytes_signature(incoming)
+        try:
+            if st.session_state.get("lr_prep_signature") != prep_sig or "lr_prep_bytes" not in st.session_state:
+                with st.spinner("Calcul de Lancement et Re-laquage..."):
+                    prepared_bytes, preview, info = prepare_lancement_relaquage_excel(incoming)
+                st.session_state["lr_prep_signature"] = prep_sig
+                st.session_state["lr_prep_bytes"] = prepared_bytes
+                st.session_state["lr_prep_preview"] = preview
+                st.session_state["lr_prep_info"] = info
+            prepared_bytes=st.session_state["lr_prep_bytes"]
+            preview=st.session_state["lr_prep_preview"]
+            info=st.session_state["lr_prep_info"]
+        except Exception as exc:
+            st.error(f"Préparation impossible: {exc}")
+            return
+
+        k1,k2,k3=st.columns(3)
+        k1.metric("Lancement total",format_num(info["total_lancement"]))
+        k2.metric("Re-laquage total",format_num(info["total_relaquage"]))
+        k3.metric("Lignes traitées",format_num(info["rows"]))
+        st.caption(f"Feuille traitée: {info['sheet']}. Le planning n'a pas encore été généré.")
+        if not preview.empty:
+            st.dataframe(preview,hide_index=True,use_container_width=True,height=420)
+        stem=Path(prep_upload.name).stem
+        st.download_button(
+            "⬇ Télécharger le fichier préparé",
+            data=prepared_bytes,
+            file_name=f"{stem}_Lancement_Relaquage.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True,
+        )
+        st.success("Etape 1 terminée. Téléchargez ce fichier, puis chargez-le dans « 2️⃣ Planning IA ».")
+        return
+
     if not ACTIVE_SOURCE_PATH.is_file():
-        cfg=_auto_cfg(pd.DataFrame(),app_today()); _top("Planning IA","Chargez une Base Excel dans la barre latérale.",cfg); st.info("Aucun autre paramètre n'est nécessaire."); return
+        cfg=_auto_cfg(pd.DataFrame(),app_today()); _top("Planning IA","Etape 2 · chargez le fichier préparé dans la barre latérale.",cfg); st.info("Le planning accepte uniquement un fichier dont Lancement et Re-laquage ont déjà été calculés à l'étape 1."); return
 
     try:
-        data=ACTIVE_SOURCE_PATH.read_bytes(); source=load_source_workbook(data); file_signature=_bytes_signature(data)
+        data=ACTIVE_SOURCE_PATH.read_bytes(); source=load_planning_source_workbook(data); file_signature=_bytes_signature(data)
     except Exception as exc:
-        cfg=_auto_cfg(pd.DataFrame(),app_today()); _top("Source invalide","La Base Excel n'a pas pu être interprétée.",cfg); st.error(f"Référence: {safe_error_id(exc)}"); return
+        cfg=_auto_cfg(pd.DataFrame(),app_today()); _top("Fichier préparé invalide","Le fichier doit passer par l'étape 1 avant de générer le planning.",cfg); st.error(str(exc)); return
 
     source_name=_active_source_name(); source_sheet=source.attrs.get("source_sheet","—")
 
@@ -5060,8 +5410,8 @@ def render_ui() -> None:
                 st.session_state["plan_source_signature"]=file_signature
         return st.session_state["plan_result"]
 
-    if nav=="🤖 Planning IA":
-        _top("Planning IA","Base Excel → planning automatique · période lundi à vendredi.",cfg)
+    if nav=="2️⃣ Planning IA":
+        _top("Planning IA","Etape 2 · fichier préparé → planning complet lundi à vendredi.",cfg)
         _admin_publication_banner(file_signature)
         c1,c2,c3=st.columns([2,1,1])
         with c1:
