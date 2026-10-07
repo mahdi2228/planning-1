@@ -5147,7 +5147,7 @@ def render_ui() -> None:
             st.session_state.pop("plan_result",None); st.session_state.pop("plan_signature",None); st.session_state.pop("plan_source_signature",None)
             st.rerun()
         st.divider()
-        nav=st.radio("Navigation admin",["🤖 Planning IA","⚖️ Balancelles","🧠 Analyse IA"],label_visibility="collapsed")
+        nav=st.radio("Navigation admin",["🤖 Planning IA","⚖️ Balancelles","🧠 Analyse IA","🔄 Suivi re-laquage"],label_visibility="collapsed")
         st.divider()
         uploaded=st.file_uploader("Base Excel",type=["xlsx"],help="Seul input requis: Base 1, Base 2 ou une nouvelle Base finale.")
         if uploaded is not None:
@@ -5158,6 +5158,16 @@ def render_ui() -> None:
                 st.session_state.pop("plan_result",None); st.session_state.pop("plan_signature",None); st.session_state.pop("plan_source_signature",None)
                 st.success("Base activée automatiquement.")
         st.markdown("<span class='private-badge'>Mode prive administrateur</span>",unsafe_allow_html=True)
+
+    if nav=="🔄 Suivi re-laquage":
+        suivi_source=pd.DataFrame()
+        if ACTIVE_SOURCE_PATH.is_file():
+            try:
+                suivi_source=load_source_workbook(ACTIVE_SOURCE_PATH.read_bytes())
+            except Exception as exc:
+                st.warning(f"Base indisponible pour le suivi; saisie atelier toujours accessible. Référence: {safe_error_id(exc)}")
+        render_suivi_relaquage(suivi_source)
+        return
 
     if not ACTIVE_SOURCE_PATH.is_file():
         cfg=_auto_cfg(pd.DataFrame(),app_today()); _top("Planning IA","Chargez une Base Excel dans la barre latérale.",cfg); st.info("Aucun autre paramètre n'est nécessaire."); return
@@ -6221,6 +6231,569 @@ def universal_self_test() -> None:
     # Conserve le point d'entree historique en y ajoutant les tests RAW.
     raw_input_self_test()
 
+
+
+# =============================================================================
+# 18) SUIVI RE-LAQUAGE - extension independante du moteur de planning
+# =============================================================================
+# Aucun changement des quantites, campagnes, publications ou exports historiques.
+# Les reliquats du modele Excel restent distincts des re-laquages confirmes.
+RQ_DB_PATH = Path(os.environ.get("ALLUCO_RELAQUAGE_DB", str(ROOT_DIR / "suivi_relaquage.sqlite3")))
+RQ_MODEL_PATH = ROOT_DIR / "Suivi_Reliquats_Laquage_Proactif.xlsx"
+RQ_TEXT_FIELDS = ("commande", "client", "article", "couleur", "of", "motif", "responsable", "commentaire", "origine")
+RQ_EDIT_FIELDS = {"Qte re-laquée": "realise", "Date prévue": "date_prevue", "Motif": "motif", "Responsable": "responsable", "Commentaire": "commentaire"}
+RQ_COLUMNS = [
+    "_id", "NumCommande", "NomClient", "Article", "Couleur", "NumOF", "Re-laquage",
+    "Qte re-laquée", "Reste à re-laquer", "Date signalement", "Date prévue",
+    "Ancienneté (jours)", "Taux restant", "Statut", "Alerte", "Motif", "Responsable",
+    "Commentaire", "Origine",
+]
+RQ_RELIQUAT_COLUMNS = [
+    "NumCommande", "DateCréation", "NomClient", "Article", "Couleur", "Nuance",
+    "QteCommandé", "ResteALivrer", "NumOF", "Lancement", "Temps dépassé (jours)",
+    "Taux de non-service", "Statut alerte reliquat",
+]
+
+
+def _rq_text(value: Any) -> str:
+    if value is None or (not isinstance(value, (list, dict)) and pd.isna(value)):
+        return ""
+    return str(value).strip()
+
+
+def _rq_integer(value: Any, label: str, minimum: int = 0) -> int:
+    try:
+        number = float(_rq_text(value).replace(" ", "").replace(" ", "").replace(",", "."))
+    except (ValueError, TypeError):
+        raise ValueError(f"{label}: indiquez un nombre entier.") from None
+    if not math.isfinite(number) or not number.is_integer() or number < minimum:
+        raise ValueError(f"{label}: entier supérieur ou égal à {minimum} requis.")
+    return int(number)
+
+
+def _rq_date(value: Any) -> Optional[date]:
+    if not _rq_text(value):
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, (int, float, np.number)):
+        parsed = parse_date(value)
+    else:
+        text = _rq_text(value)
+        # Les dates francaises du modele sont explicites: JJ/MM/AAAA.
+        parsed = pd.to_datetime(text, errors="coerce", dayfirst=bool(re.match(r"^\d{1,2}[/.-]\d{1,2}[/.-]\d{4}", text)))
+    if parsed is None or pd.isna(parsed):
+        raise ValueError(f"Date invalide: {value}")
+    return parsed.date()
+
+
+def _rq_validate(record: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(record)
+    out.pop("_revision", None)
+    out["id"] = _rq_text(out.get("id"))
+    if not out["id"]:
+        raise ValueError("Identifiant de suivi manquant.")
+    for field in RQ_TEXT_FIELDS:
+        out[field] = _rq_text(out.get(field))
+    if not out["article"] or not out["couleur"]:
+        raise ValueError("Article et couleur sont obligatoires.")
+    out["quantite"] = _rq_integer(out.get("quantite"), "Re-laquage", 1)
+    out["realise"] = _rq_integer(out.get("realise", 0), "Qte re-laquée")
+    if out["realise"] > out["quantite"]:
+        raise ValueError(f"{out['article']}: la quantité réalisée dépasse le re-laquage demandé.")
+    for field in ("date_signalement", "date_prevue", "date_creation"):
+        parsed = _rq_date(out.get(field))
+        out[field] = parsed.isoformat() if parsed else None
+    if not out["date_signalement"]:
+        raise ValueError("Date de signalement obligatoire.")
+    if _rq_date(out["date_signalement"]) > app_today():
+        raise ValueError("La date de signalement ne peut pas être future.")
+    return out
+
+
+def _rq_connect(path: Optional[Path] = None):
+    import sqlite3
+    db_path = Path(path) if path is not None else RQ_DB_PATH
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(db_path), timeout=20)
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS relaquages (id TEXT PRIMARY KEY, payload TEXT NOT NULL, revision INTEGER NOT NULL)")
+        con.commit()
+        return con
+    except Exception:
+        con.close()
+        raise
+
+
+def _rq_load(path: Optional[Path] = None) -> List[Dict[str, Any]]:
+    con = _rq_connect(path)
+    try:
+        rows = []
+        for rid, payload, revision in con.execute("SELECT id, payload, revision FROM relaquages ORDER BY id"):
+            rec = _rq_validate(json.loads(payload))
+            if rec["id"] != rid:
+                raise ValueError("Registre de re-laquage incohérent; aucun écrasement effectué.")
+            rec["_revision"] = int(revision)
+            rows.append(rec)
+        return rows
+    finally:
+        con.close()
+
+
+def _rq_save(records: Sequence[Dict[str, Any]], path: Optional[Path] = None) -> int:
+    """Sauvegarde transactionnelle; refuse un ecrasement concurrent ou une surproduction."""
+    import sqlite3
+    prepared = [(r, _rq_validate(r)) for r in records]
+    con = _rq_connect(path)
+    try:
+        with con:
+            for original, rec in prepared:
+                rec["mis_a_jour"] = app_now().isoformat(timespec="seconds")
+                payload = json.dumps(rec, ensure_ascii=False, allow_nan=False)
+                revision = int(original.get("_revision", 0))
+                if revision == 0:
+                    try:
+                        con.execute("INSERT INTO relaquages VALUES (?, ?, 1)", (rec["id"], payload))
+                    except sqlite3.IntegrityError:
+                        raise ValueError("Dossier déjà enregistré. Actualisez le suivi.") from None
+                else:
+                    cur = con.execute("UPDATE relaquages SET payload=?, revision=revision+1 WHERE id=? AND revision=?", (payload, rec["id"], revision))
+                    if cur.rowcount != 1:
+                        raise ValueError("Le suivi a été modifié dans une autre session. Actualisez avant de réessayer.")
+        return len(prepared)
+    finally:
+        con.close()
+
+
+def _rq_candidates(source: pd.DataFrame, reference_date: Optional[date] = None) -> List[Dict[str, Any]]:
+    """Uniquement Re-laquage > 0. Jamais ResteALivrer, Lancement ou stock."""
+    if source is None or source.empty or "Re-laquage" not in source.columns:
+        return []
+    today_value = reference_date or app_today()
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for _, row in source.iterrows():
+        raw = row.get("Re-laquage")
+        if not _rq_text(raw):
+            continue
+        qty = _rq_integer(raw, f"Re-laquage / {_rq_text(row.get('Article'))}")
+        if qty == 0:
+            continue
+        article = _rq_text(row.get("Article"))
+        color = _rq_text(row.get("Couleur"))
+        cmd = _rq_text(row.get("NumCommande"))
+        of = _rq_text(row.get("NumOF"))
+        if not article or not color:
+            raise ValueError("Un re-laquage positif de la Base n'a pas d'article ou de couleur.")
+        # Regroupement explicite commande + article + couleur + OF: stable si la Base est retriee.
+        key = json.dumps([cmd.upper(), article.upper(), color.upper(), of.upper()], ensure_ascii=False)
+        rid = "BASE-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+        if rid not in grouped:
+            created = _rq_date(row.get("DateCréation"))
+            grouped[rid] = {
+                "id": rid, "commande": cmd, "client": _rq_text(row.get("NomClient")),
+                "article": article, "couleur": color, "of": of, "quantite": 0, "realise": 0,
+                "date_creation": created.isoformat() if created else None,
+                "date_signalement": today_value.isoformat(), "date_prevue": None,
+                "motif": "", "responsable": "", "commentaire": "", "origine": "Base Excel",
+            }
+        grouped[rid]["quantite"] += qty
+    return list(grouped.values())
+
+
+def _rq_import_base(candidates: Sequence[Dict[str, Any]], path: Optional[Path] = None) -> Tuple[int, int]:
+    """Ajoute/actualise sur clic sans effacer le realise, les commentaires ou l'historique."""
+    con = _rq_connect(path)
+    added = updated = 0
+    try:
+        with con:
+            # Verrou en ecriture avant toute lecture pour eviter les imports concurrents.
+            con.execute("BEGIN IMMEDIATE")
+            for candidate in candidates:
+                rec = _rq_validate(candidate)
+                old = con.execute("SELECT payload, revision FROM relaquages WHERE id=?", (rec["id"],)).fetchone()
+                if old is not None:
+                    current = json.loads(old[0])
+                    merged = dict(current)
+                    for field in ("commande", "client", "article", "couleur", "of", "quantite", "date_creation"):
+                        merged[field] = rec.get(field)
+                    rec = _rq_validate(merged)
+                    if rec == current:
+                        continue
+                    updated += 1
+                else:
+                    added += 1
+                rec["mis_a_jour"] = app_now().isoformat(timespec="seconds")
+                payload = json.dumps(rec, ensure_ascii=False, allow_nan=False)
+                if old is None:
+                    con.execute("INSERT INTO relaquages VALUES (?, ?, 1)", (rec["id"], payload))
+                else:
+                    con.execute("UPDATE relaquages SET payload=?, revision=revision+1 WHERE id=?", (payload, rec["id"]))
+        return added, updated
+    finally:
+        con.close()
+
+
+def _rq_table(records: Sequence[Dict[str, Any]], reference_date: Optional[date] = None, threshold: int = 30) -> pd.DataFrame:
+    today_value = reference_date or app_today()
+    rows = []
+    for r in records:
+        total = _rq_integer(r["quantite"], "Re-laquage", 1)
+        done = _rq_integer(r["realise"], "Qte re-laquée")
+        if done > total:
+            raise ValueError("La quantite realisee depasse le re-laquage demande.")
+        remaining = total - done
+        signaled = _rq_date(r["date_signalement"])
+        due = _rq_date(r.get("date_prevue"))
+        age = max(0, (today_value - signaled).days)
+        state = "Terminé" if remaining == 0 else "En cours" if done > 0 else "À traiter"
+        late = remaining > 0 and (age > threshold or (due is not None and due < today_value))
+        rows.append({
+            "_id": r["id"], "NumCommande": r["commande"], "NomClient": r["client"],
+            "Article": r["article"], "Couleur": r["couleur"], "NumOF": r["of"],
+            "Re-laquage": total, "Qte re-laquée": done, "Reste à re-laquer": remaining,
+            "Date signalement": signaled, "Date prévue": due, "Ancienneté (jours)": age,
+            "Taux restant": remaining / total, "Statut": state,
+            "Alerte": "RETARD CRITIQUE" if late else "SOLDÉ" if remaining == 0 else "EN ATTENTE",
+            "Motif": r["motif"], "Responsable": r["responsable"], "Commentaire": r["commentaire"],
+            "Origine": r["origine"],
+        })
+    frame = pd.DataFrame(rows, columns=RQ_COLUMNS)
+    if not frame.empty:
+        frame = frame.sort_values(["Reste à re-laquer", "Ancienneté (jours)"], ascending=[False, False], kind="stable").reset_index(drop=True)
+    return frame
+
+
+def _rq_excel_cell(ws, row: int, col: int, value: Any):
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        value = None
+    elif isinstance(value, np.generic):
+        value = value.item()
+    cell = ws.cell(row, col, value)
+    # Les champs saisis/importes restent du texte, jamais des formules injectees.
+    if isinstance(value, str):
+        cell.data_type = "s"
+    return cell
+
+
+def _rq_export(frame: pd.DataFrame, reference_date: date, threshold: int = 30, reliquats: bool = False) -> bytes:
+    """Export separe. Les colonnes derivees restent des formules Excel."""
+    from openpyxl.workbook.properties import CalcProperties
+    wb = Workbook()
+    info = wb.active
+    info.title = "Résumé suivi"
+    info.append(["ALLUCO - Suivi reliquats" if reliquats else "ALLUCO - Suivi re-laquage", None])
+    info.append(["Date du constat", reference_date])
+    info.append(["Seuil d'alerte (jours)", int(threshold)])
+    info.append(["Lignes exportées", len(frame)])
+    info.append(["Périmètre", "Vue filtrée; aucun changement du planning."])
+    info.append(["Règle", "Temps dépassé conservé depuis le fichier source." if reliquats else "Reste = demandé - réalisé; retard si date prévue dépassée ou ancienneté > seuil."])
+    info.merge_cells("A1:B1")
+    info["B2"].number_format = "dd/mm/yyyy"
+    title = "Reliquats" if reliquats else "Re-laquage"
+    ws = wb.create_sheet(title)
+    columns = RQ_RELIQUAT_COLUMNS if reliquats else [c for c in RQ_COLUMNS if c != "_id"]
+    for c, name in enumerate(columns, 1):
+        ws.cell(1, c, name)
+    for ri, (_, row) in enumerate(frame.iterrows(), 2):
+        for ci, name in enumerate(columns, 1):
+            cell = _rq_excel_cell(ws, ri, ci, row.get(name))
+            if isinstance(cell.value, (date, datetime)):
+                cell.number_format = "dd/mm/yyyy"
+            elif isinstance(cell.value, (int, float)):
+                cell.number_format = "General" if name == "Nuance" else "0"
+        if reliquats:
+            # G=commande; H=reste; K=temps depasse. Meme logique que le modele fourni.
+            ws.cell(ri, 12, f'=IF(NOT(AND(ISNUMBER(G{ri}),ISNUMBER(H{ri}))),"",IF(G{ri}>0,H{ri}/G{ri},0))')
+            ws.cell(ri, 13, f'=IF(NOT(ISNUMBER(H{ri})),"À CONTRÔLER",IF(AND(K{ri}>\'Résumé suivi\'!$B$3,H{ri}>0),"RETARD CRITIQUE",IF(H{ri}>0,"EN ATTENTE LAQUAGE","SOLDÉ")))')
+            ws.cell(ri, 12).number_format = "0.0%"
+        else:
+            # F=demande; G=realise; H=reste; I=signalement; J=prevue.
+            ws.cell(ri, 8, f"=MAX(0,F{ri}-G{ri})")
+            ws.cell(ri, 11, f'=IF(I{ri}="","",MAX(0,\'Résumé suivi\'!$B$2-I{ri}))')
+            ws.cell(ri, 12, f'=IF(F{ri}>0,H{ri}/F{ri},0)')
+            ws.cell(ri, 13, f'=IF(H{ri}=0,"Terminé",IF(G{ri}>0,"En cours","À traiter"))')
+            ws.cell(ri, 14, f'=IF(H{ri}=0,"SOLDÉ",IF(OR(K{ri}>\'Résumé suivi\'!$B$3,AND(ISNUMBER(J{ri}),J{ri}<\'Résumé suivi\'!$B$2)),"RETARD CRITIQUE","EN ATTENTE"))')
+            ws.cell(ri, 12).number_format = "0.0%"
+    end = max(2, len(frame) + 1)
+    total_formula = f"=SUM('{title}'!H2:H{end})"
+    if reliquats and len(frame):
+        total_formula = f"=IF(COUNT('{title}'!H2:H{end})<{len(frame)},\"\",SUM('{title}'!H2:H{end}))"
+    info.append(["Reste total (barres)", total_formula])
+    if not reliquats:
+        info.append(["Demandé (barres)", f"=SUM('{title}'!F2:F{end})"])
+        info.append(["Réalisé (barres)", f"=SUM('{title}'!G2:G{end})"])
+    info.column_dimensions["A"].width = 30
+    info.column_dimensions["B"].width = 88
+    for cell in info[1]:
+        cell.fill = PatternFill("solid", fgColor="163A5F")
+        cell.font = Font(bold=True, color="FFFFFF", size=13)
+    info.row_dimensions[1].height = 30
+    info.row_dimensions[6].height = 34
+    info["B6"].alignment = Alignment(wrap_text=True, vertical="center")
+    for ci, name in enumerate(columns, 1):
+        cell = ws.cell(1, ci)
+        cell.fill = PatternFill("solid", fgColor="163A5F")
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.column_dimensions[get_column_letter(ci)].width = 30 if name in {"NomClient", "Commentaire", "Motif"} else 23 if name in {"Article", "Alerte", "Statut alerte reliquat"} else 19
+    ws.row_dimensions[1].height = 42
+    for ri in range(2, len(frame) + 2):
+        ws.row_dimensions[ri].height = 32
+        for cell in ws[ri]:
+            name = columns[cell.column - 1]
+            centered = name in {"Nuance", "Re-laquage", "Qte re-laquée", "Reste à re-laquer",
+                                "QteCommandé", "ResteALivrer", "Lancement", "Temps dépassé (jours)",
+                                "Ancienneté (jours)", "Taux restant", "Taux de non-service", "Statut", "Alerte", "Statut alerte reliquat"}
+            cell.alignment = Alignment(horizontal="center" if centered else "left", vertical="center", wrap_text=True)
+            if ri % 2 == 0:
+                cell.fill = PatternFill("solid", fgColor="EEF4FF")
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{max(1, len(frame)+1)}"
+    for sheet in wb:
+        sheet.sheet_view.showGridLines = False
+    wb.calculation = CalcProperties(calcId=191029, fullCalcOnLoad=True)
+    stream = io.BytesIO()
+    wb.save(stream)
+    return stream.getvalue()
+
+
+def _rq_read_reliquats(data: bytes) -> Dict[str, pd.DataFrame]:
+    """Lit les feuilles mensuelles, ignore les lignes vides contenant seulement des formules."""
+    aliases = {
+        "num_commande": "NumCommande", "numcommande": "NumCommande", "datecreation": "DateCréation",
+        "nom_client": "NomClient", "nomclient": "NomClient", "article": "Article", "couleur": "Couleur",
+        "nuance": "Nuance", "qte_commandee": "QteCommandé", "qtecommande": "QteCommandé",
+        "reste_a_livrer": "ResteALivrer", "restealivrer": "ResteALivrer", "num_of": "NumOF",
+        "numof": "NumOF", "lancement": "Lancement", "temps_depasse_jours": "Temps dépassé (jours)",
+    }
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    sheets: Dict[str, pd.DataFrame] = {}
+    try:
+        for ws in wb:
+            mapping = {}
+            header_row = None
+            for ri, values in enumerate(ws.iter_rows(min_row=1, max_row=min(ws.max_row, 25), values_only=True), 1):
+                candidate = {}
+                for ci, value in enumerate(values):
+                    first_line = _rq_text(value).split("\n", 1)[0]
+                    canonical = aliases.get(norm_key(first_line))
+                    if canonical:
+                        candidate[ci] = canonical
+                if {"Article", "QteCommandé", "ResteALivrer"}.issubset(candidate.values()):
+                    mapping, header_row = candidate, ri
+                    break
+            if header_row is None:
+                continue
+            rows = []
+            for values in ws.iter_rows(min_row=header_row + 1, values_only=True):
+                rec = {name: values[ci] if ci < len(values) else None for ci, name in mapping.items()}
+                if not _rq_text(rec.get("Article")):
+                    continue
+                for field in ("NumCommande", "NomClient", "Article", "Couleur", "NumOF"):
+                    rec[field] = _rq_text(rec.get(field))
+                for field in ("QteCommandé", "ResteALivrer", "Lancement", "Temps dépassé (jours)"):
+                    value = rec.get(field)
+                    rec[field] = _rq_integer(value, field) if _rq_text(value) else None
+                qty, remain, age = rec.get("QteCommandé"), rec.get("ResteALivrer"), rec.get("Temps dépassé (jours)")
+                rec["Taux de non-service"] = None if qty is None or remain is None else remain / qty if qty > 0 else 0.0
+                rec["Statut alerte reliquat"] = "À CONTRÔLER" if remain is None else "SOLDÉ" if remain == 0 else "RETARD CRITIQUE" if age is not None and age > 30 else "EN ATTENTE LAQUAGE"
+                rows.append(rec)
+            sheets[ws.title] = pd.DataFrame(rows, columns=RQ_RELIQUAT_COLUMNS)
+    finally:
+        wb.close()
+    if not sheets:
+        raise ValueError("Aucune feuille de reliquats reconnue (Article / Qte Commandée / Reste A Livrer).")
+    return sheets
+
+
+def _rq_refresh(message: str = "") -> None:
+    st.session_state.pop("_rq_records_snapshot", None)
+    st.session_state["_rq_flash"] = message
+    st.rerun()
+
+
+def _rq_render_new() -> None:
+    import uuid
+    with st.expander("Ajouter un re-laquage / une non-conformité"):
+        with st.form("rq_new_record", clear_on_submit=False):
+            a, b, c = st.columns(3)
+            cmd = a.text_input("Numéro de commande (facultatif)", key="rq_new_cmd")
+            client = b.text_input("Client", key="rq_new_client")
+            article = c.text_input("Article *", key="rq_new_article")
+            a, b, c = st.columns(3)
+            color = a.text_input("Couleur *", key="rq_new_color")
+            of = b.text_input("Numéro OF", key="rq_new_of")
+            qty = c.number_input("Quantité à re-laquer *", min_value=1, value=1, step=1, key="rq_new_qty")
+            a, b, c = st.columns(3)
+            signaled = a.date_input("Date de signalement", value=app_today(), max_value=app_today(), key="rq_new_date")
+            due = b.date_input("Date prévue (facultative)", value=None, key="rq_new_due")
+            owner = c.text_input("Responsable", key="rq_new_owner")
+            reason = st.text_input("Motif / défaut constaté", key="rq_new_reason")
+            note = st.text_area("Commentaire", key="rq_new_note")
+            if st.form_submit_button("Ajouter au suivi", type="primary"):
+                record = {"id": "MANUEL-" + uuid.uuid4().hex, "commande": cmd, "client": client,
+                          "article": article, "couleur": color, "of": of, "quantite": qty, "realise": 0,
+                          "date_signalement": signaled, "date_prevue": due, "date_creation": None,
+                          "motif": reason, "responsable": owner, "commentaire": note, "origine": "Saisie atelier"}
+                try:
+                    _rq_save([record])
+                except Exception as exc:
+                    st.error(f"Ajout non enregistré: {exc}")
+                else:
+                    _rq_refresh("Re-laquage ajouté. Le planning reste inchangé.")
+
+
+def _rq_render_register(source: pd.DataFrame) -> None:
+    st.caption("Les re-laquages sont ajoutés depuis la colonne Re-laquage de la Base ou par saisie atelier. Un reliquat client n'est jamais converti automatiquement en re-laquage.")
+    flash = st.session_state.pop("_rq_flash", "")
+    if flash:
+        st.success(flash)
+    a, b = st.columns([3, 1])
+    with a:
+        try:
+            candidates = _rq_candidates(source)
+            if st.button(f"Ajouter / actualiser les re-laquages de la Base ({len(candidates)})", disabled=not candidates, key="rq_import_base"):
+                added, updated = _rq_import_base(candidates)
+                _rq_refresh(f"{added} dossier(s) ajouté(s), {updated} actualisé(s). Réalisations et commentaires conservés.")
+        except Exception as exc:
+            st.error(f"Import re-laquage non effectué: {exc}")
+    with b:
+        if st.button("Actualiser le suivi", key="rq_refresh"):
+            _rq_refresh()
+    st.caption("Import regroupé par commande + article + couleur + OF, sans doublon au second import. La date de signalement initiale est la date d'import; elle n'est pas la date de création de la commande.")
+    _rq_render_new()
+    try:
+        if "_rq_records_snapshot" not in st.session_state:
+            st.session_state["_rq_records_snapshot"] = _rq_load()
+        records = st.session_state["_rq_records_snapshot"]
+    except Exception as exc:
+        st.error(f"Registre indisponible; aucune donnée n'a été remplacée: {exc}")
+        return
+    if not records:
+        st.info("Aucun re-laquage enregistré. Importez les quantités positives de la Base ou ajoutez un dossier atelier.")
+        return
+    a, b, c, d = st.columns([2, 1, 1, 1])
+    query = a.text_input("Rechercher commande, client, article ou OF", key="rq_query")
+    state = b.selectbox("Statut", ["Tous", "À traiter", "En cours", "Terminé"], key="rq_state")
+    colors = sorted({_rq_text(r["couleur"]) for r in records if _rq_text(r["couleur"])})
+    color = c.selectbox("Couleur", ["Toutes"] + colors, key="rq_color")
+    threshold = int(d.number_input("Alerte après (jours)", min_value=1, value=30, step=1, key="rq_threshold"))
+    frame = _rq_table(records, app_today(), threshold)
+    if query.strip():
+        text = frame[["NumCommande", "NomClient", "Article", "NumOF"]].fillna("").astype(str).agg(" ".join, axis=1)
+        frame = frame.loc[text.str.contains(query.strip(), case=False, regex=False)]
+    if state != "Tous":
+        frame = frame.loc[frame["Statut"] == state]
+    if color != "Toutes":
+        frame = frame.loc[frame["Couleur"] == color]
+    frame = frame.reset_index(drop=True)
+    kpis = st.columns(4)
+    metrics = [("À re-laquer (demandé)", frame["Re-laquage"].sum()), ("Réalisé", frame["Qte re-laquée"].sum()), ("Restant", frame["Reste à re-laquer"].sum()), ("Alertes", (frame["Alerte"] == "RETARD CRITIQUE").sum())]
+    for col, (label, value) in zip(kpis, metrics):
+        with col:
+            _kpi(label, format_num(value), "vue filtrée")
+    if frame.empty:
+        st.info("Aucun dossier ne correspond aux filtres.")
+        return
+    st.caption("Modifiez la quantité réalisée, la date prévue, le motif, le responsable ou le commentaire, puis enregistrez. Les indicateurs seront recalculés après enregistrement.")
+    token = hashlib.sha256(json.dumps([(r["id"], r["_revision"]) for r in records], sort_keys=True).encode()).hexdigest()[:12]
+    token += hashlib.sha256("|".join(frame["_id"].tolist()).encode()).hexdigest()[:8]
+    edit_frame = frame.copy()
+    edit_frame["Taux restant"] = pd.to_numeric(edit_frame["Taux restant"]) * 100.0
+    for field in ("Date signalement", "Date prévue"):
+        edit_frame[field] = pd.to_datetime(edit_frame[field])
+    with st.form("rq_edit_form_" + token):
+        edited = st.data_editor(edit_frame, hide_index=True, use_container_width=True, height=440,
+            key="rq_editor_" + token, num_rows="fixed", disabled=[c for c in edit_frame.columns if c not in RQ_EDIT_FIELDS],
+            column_config={"_id": None, "Qte re-laquée": st.column_config.NumberColumn(min_value=0, step=1, required=True),
+                           "Date signalement": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                           "Date prévue": st.column_config.DateColumn(format="DD/MM/YYYY"),
+                           "Taux restant": st.column_config.NumberColumn("Taux restant (%)", format="%.1f %%")})
+        if st.form_submit_button("Enregistrer le suivi", type="primary"):
+            try:
+                originals = {r["id"]: r for r in records}
+                changes = []
+                if edited["_id"].tolist() != frame["_id"].tolist():
+                    raise ValueError("La structure du tableau a changé. Actualisez le suivi.")
+                for _, row in edited.iterrows():
+                    old = originals[row["_id"]]
+                    updated = dict(old)
+                    for field, target in RQ_EDIT_FIELDS.items():
+                        updated[target] = row[field]
+                    if _rq_validate(updated) != _rq_validate(old):
+                        changes.append(updated)
+                count = _rq_save(changes)
+            except Exception as exc:
+                st.error(f"Sauvegarde refusée: {exc}")
+            else:
+                _rq_refresh(f"{count} dossier(s) mis à jour.")
+    st.download_button("Télécharger le suivi re-laquage Excel", _rq_export(frame, app_today(), threshold),
+        file_name=f"Suivi_Relaquage_{app_today().isoformat()}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rq_download")
+    st.caption("L'export contient la vue filtrée enregistrée. Les dossiers terminés restent dans le registre; ils ne sont jamais supprimés par un changement de Base.")
+
+
+def _rq_render_reliquats() -> None:
+    st.caption("Lecture du modèle de reliquats fourni. Reste A Livrer n'est pas une quantité de re-laquage; aucune ligne de cet onglet n'est ajoutée automatiquement au registre.")
+    uploaded = st.file_uploader("Fichier de suivi des reliquats (facultatif)", type=["xlsx"], key="rq_reliquat_file")
+    if uploaded is not None:
+        data = uploaded.getvalue()
+    elif RQ_MODEL_PATH.is_file():
+        data = RQ_MODEL_PATH.read_bytes()
+    else:
+        st.info("Chargez Suivi_Reliquats_Laquage_Proactif.xlsx ici, ou placez-le à côté du script.")
+        return
+    try:
+        sheets = _rq_read_reliquats(data)
+    except Exception as exc:
+        st.error(f"Lecture des reliquats impossible: {exc}")
+        return
+    month = st.selectbox("Mois / feuille", list(sheets), key="rq_reliquat_month")
+    frame = sheets[month].copy()
+    if frame.empty:
+        st.info("Cette feuille est un modèle vide: aucune ligne métier, uniquement des formules préparées.")
+        return
+    a, b = st.columns([2, 1])
+    query = a.text_input("Rechercher dans les reliquats", key="rq_reliquat_query")
+    only_open = b.checkbox("Uniquement les reliquats ouverts", value=False, key="rq_reliquat_open")
+    if query.strip():
+        text = frame[["NumCommande", "NomClient", "Article", "NumOF"]].fillna("").astype(str).agg(" ".join, axis=1)
+        frame = frame.loc[text.str.contains(query.strip(), case=False, regex=False)]
+    if only_open:
+        frame = frame.loc[pd.to_numeric(frame["ResteALivrer"], errors="coerce") > 0]
+    cols = st.columns(3)
+    qty = pd.to_numeric(frame["ResteALivrer"], errors="coerce")
+    rate = pd.to_numeric(frame["Taux de non-service"], errors="coerce")
+    age = pd.to_numeric(frame["Temps dépassé (jours)"], errors="coerce")
+    vals = [("Reliquat total (barres)", "—" if qty.isna().any() else format_num(qty.sum())),
+            ("Non-service moyen", f"{rate.mean():.1%}" if rate.notna().any() else "—"),
+            ("Temps dépassé moyen", f"{age.mean():.1f} j" if age.notna().any() else "—")]
+    for col, (label, value) in zip(cols, vals):
+        with col:
+            _kpi(label, value, "vue filtrée")
+    st.caption("Temps dépassé: valeurs du fichier, non actualisées à la date du jour. Non-service = Reste A Livrer / Qte Commandée (0 si quantité commandée nulle). Alerte critique: temps > 30 jours et reste > 0.")
+    if frame[["QteCommandé", "ResteALivrer", "Temps dépassé (jours)"]].isna().any().any():
+        st.warning("Certaines valeurs sources sont absentes. Les moyennes portent seulement sur les valeurs renseignées; les quantités manquantes ne sont pas remplacées par zéro.")
+    display_frame = frame.copy()
+    display_frame["Taux de non-service"] = pd.to_numeric(display_frame["Taux de non-service"], errors="coerce") * 100.0
+    st.dataframe(display_frame, hide_index=True, use_container_width=True, height=450,
+                 column_config={"Taux de non-service": st.column_config.NumberColumn("Non-service (%)", format="%.1f %%")})
+    st.download_button("Télécharger la vue reliquats Excel", _rq_export(frame, app_today(), 30, reliquats=True),
+        file_name=f"Suivi_Reliquats_{norm_key(month)}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="rq_reliquat_download")
+
+
+def render_suivi_relaquage(source: Optional[pd.DataFrame] = None) -> None:
+    source = source if source is not None else pd.DataFrame()
+    cfg = _auto_cfg(source, app_today())
+    _top("Suivi re-laquage", "Suivi atelier indépendant du planning et du portail client.", cfg)
+    st.markdown("<div class='hero'><div class='hero-title'>Re-laquage et reliquats</div><div class='hero-sub'>Quantités, avancement et alertes atelier. Les règles de planning, les campagnes couleur et les publications existantes restent inchangées.</div></div>", unsafe_allow_html=True)
+    first, second = st.tabs(["Re-laquage", "Reliquats Excel"])
+    with first:
+        _rq_render_register(source)
+    with second:
+        _rq_render_reliquats()
+    st.caption("Sauvegarde atelier: suivi_relaquage.sqlite3 (ou chemin ALLUCO_RELAQUAGE_DB). Sur un hébergement à disque éphémère, utilisez un volume persistant et conservez une copie du registre.")
 
 
 if __name__ == "__main__":
