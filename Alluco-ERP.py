@@ -74,13 +74,19 @@ except Exception:
 # =============================================================================
 # 01. CONFIGURATION
 # =============================================================================
-VERSION = "8.0.0"
+VERSION = "8.1.0"
 APP_NAME = "ALLUCO - Industrial ERP IA"
 APP_SUBTITLE = "Planning · Magasin · Laquage · Qualite · Logistique"
 ROOT_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("ALLUCO_DB_PATH", str(ROOT_DIR / "alluco.db")))
 APP_TIMEZONE = os.environ.get("ALLUCO_TIMEZONE", "Africa/Tunis")
 CLIENT_ACCESS_CODE = os.environ.get("ALLUCO_CLIENT_ACCESS_CODE", "")
+
+# Identite visuelle. Priorite aux fichiers locaux si presents; sinon URLs GitHub RAW.
+LOGO_DARK_URL = "https://raw.githubusercontent.com/mahdi2228/planning-1/main/logo_dark.png"
+LOGO_WHITE_URL = "https://raw.githubusercontent.com/mahdi2228/planning-1/main/logo_white.png"
+LOGO_DARK_PATH = ROOT_DIR / "logo_dark.png"
+LOGO_WHITE_PATH = ROOT_DIR / "logo_white.png"
 
 DAYS = ["LUNDI", "MARDI", "MERCREDI", "JEUDI", "VENDREDI"]
 DEFAULT_CAPACITY_H = 16.0
@@ -233,6 +239,41 @@ def json_dumps(v: Any) -> str:
 
 def esc(v: Any) -> str:
     return html.escape(norm_text(v), quote=True)
+
+
+def file_data_uri(path: Path) -> str:
+    """Retourne un data URI pour une image locale; chaîne vide en cas d'échec."""
+    try:
+        if path.is_file():
+            data = path.read_bytes()
+            if data:
+                mime = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+                return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+    except Exception:
+        pass
+    return ""
+
+
+def brand_logo_src(dark_mode: bool) -> str:
+    """Logo blanc sur fond sombre, logo sombre sur fond clair.
+
+    Les fichiers locaux sont utilisés en priorité pour permettre un fonctionnement
+    hors-ligne. S'ils sont absents, l'URL RAW GitHub fournie est utilisée.
+    """
+    if dark_mode:
+        return file_data_uri(LOGO_WHITE_PATH) or LOGO_WHITE_URL
+    return file_data_uri(LOGO_DARK_PATH) or LOGO_DARK_URL
+
+
+def brand_html(dark_mode: bool, compact: bool = False) -> str:
+    src = esc(brand_logo_src(dark_mode))
+    compact_cls = " brand-compact" if compact else ""
+    return (
+        f"<div class='brand-shell{compact_cls}'>"
+        f"<img class='brand-logo' src='{src}' alt='ALLUCO'>"
+        f"<div class='brand-copy'><div class='brand-title'>Industrial ERP IA</div>"
+        f"<div class='brand-sub'>Planning · Magasin · Laquage · Qualité · Logistique</div></div></div>"
+    )
 
 
 def article_family(article_internal: str) -> str:
@@ -658,10 +699,10 @@ def role_can(role: str, area: str) -> bool:
     if role == "ADMIN":
         return True
     matrix = {
-        "DIRECTION": {"dashboard", "analysis", "notifications"},
-        "PLANNING": {"dashboard", "planning", "analysis", "notifications", "orders"},
+        "DIRECTION": {"dashboard", "balancelles", "analysis", "notifications"},
+        "PLANNING": {"dashboard", "planning", "balancelles", "analysis", "notifications", "orders"},
         "MAGASIN": {"dashboard", "magasin", "notifications"},
-        "LAQUAGE": {"dashboard", "laquage", "notifications"},
+        "LAQUAGE": {"dashboard", "balancelles", "laquage", "notifications"},
         "QUALITE": {"dashboard", "quality", "relaquage", "notifications"},
         "LOGISTIQUE": {"dashboard", "logistics", "notifications"},
         "COMMERCIAL": {"dashboard", "orders", "notifications"},
@@ -1892,19 +1933,67 @@ def export_plan_pdf(result: Dict[str, Any]) -> bytes:
 # =============================================================================
 # 14. UI / DESIGN
 # =============================================================================
-def app_css() -> str:
-    return """
+def app_css(dark_mode: bool = False) -> str:
+    if dark_mode:
+        theme = {
+            "bg": "#0B1220", "surface": "#111827", "surface2": "#172033", "ink": "#F4F7FB",
+            "muted": "#AAB4C3", "line": "#2A3547", "primary": "#5B8CFF", "primary2": "#2F6BFF",
+            "soft": "#142342", "success": "#4ADE80", "warning": "#FBBF24", "danger": "#FB7185",
+            "hero1": "#10243E", "hero2": "#1D4ED8", "shadow": "rgba(0,0,0,.28)", "input": "#0F172A",
+        }
+        scheme = "dark"
+    else:
+        theme = {
+            "bg": "#F4F7FB", "surface": "#FFFFFF", "surface2": "#F8FAFC", "ink": "#162033",
+            "muted": "#667085", "line": "#E1E7EF", "primary": "#155EEF", "primary2": "#0B5ED7",
+            "soft": "#EEF4FF", "success": "#067647", "warning": "#B54708", "danger": "#B42318",
+            "hero1": "#123B67", "hero2": "#155EEF", "shadow": "rgba(16,24,40,.08)", "input": "#FFFFFF",
+        }
+        scheme = "light"
+    return f"""
     <style>
-      .block-container{max-width:1550px;padding-top:1.2rem;padding-bottom:2rem}
-      #MainMenu,footer,[data-testid="stDeployButton"]{visibility:hidden}
-      .alluco-hero{background:linear-gradient(135deg,#14365A,#155EEF);color:white;padding:1.15rem 1.3rem;border-radius:18px;margin-bottom:1rem}
-      .alluco-hero *{color:white!important}.alluco-title{font-size:1.55rem;font-weight:900}.alluco-sub{opacity:.9;font-size:.88rem;margin-top:.2rem}
-      .erp-card{border:1px solid #E4E7EC;border-radius:14px;padding:.9rem 1rem;background:#fff;margin-bottom:.7rem}
-      .erp-muted{color:#667085;font-size:.82rem}.erp-badge{display:inline-block;padding:.28rem .55rem;border-radius:999px;background:#EEF4FF;color:#155EEF;font-weight:800;font-size:.75rem}
-      .erp-ok{background:#ECFDF3;color:#067647}.erp-warn{background:#FFFAEB;color:#B54708}.erp-err{background:#FEF3F2;color:#B42318}
-      [data-testid="stMetric"]{border:1px solid #E4E7EC;border-radius:13px;padding:.6rem .8rem;background:white}
-      [data-testid="stDataFrame"],[data-testid="stDataEditor"]{border:1px solid #E4E7EC;border-radius:12px;overflow:hidden}
-      .stButton>button,.stDownloadButton>button{border-radius:10px;font-weight:750;min-height:40px}
+      :root{{--bg:{theme['bg']};--surface:{theme['surface']};--surface2:{theme['surface2']};--ink:{theme['ink']};--muted:{theme['muted']};--line:{theme['line']};--primary:{theme['primary']};--primary2:{theme['primary2']};--soft:{theme['soft']};--success:{theme['success']};--warning:{theme['warning']};--danger:{theme['danger']};--input:{theme['input']};--shadow:{theme['shadow']};}}
+      html,body,.stApp,[data-testid="stAppViewContainer"]{{background:var(--bg)!important;color:var(--ink)!important;color-scheme:{scheme}!important}}
+      .block-container{{max-width:1580px;padding-top:1.05rem;padding-bottom:2.2rem}}
+      #MainMenu,footer,[data-testid="stDeployButton"],[data-testid="stToolbar"],[data-testid="stDecoration"]{{display:none!important}}
+      header[data-testid="stHeader"]{{background:transparent!important}}
+      h1,h2,h3,h4,h5,h6,p,label,span,div{{color:var(--ink)}}
+      [data-testid="stCaptionContainer"],.stCaption,.erp-muted{{color:var(--muted)!important}}
+
+      section[data-testid="stSidebar"]{{background:var(--surface)!important;border-right:1px solid var(--line)!important}}
+      section[data-testid="stSidebar"]>div{{background:var(--surface)!important}}
+      .brand-shell{{display:flex;align-items:center;gap:.8rem;padding:.2rem 0 .85rem}}
+      .brand-shell.brand-compact{{padding:.05rem 0 .45rem}}
+      .brand-logo{{width:185px;max-width:72%;height:64px;object-fit:contain;object-position:left center;display:block}}
+      .brand-copy{{min-width:0}}.brand-title{{font-size:.82rem;font-weight:900;letter-spacing:.03em}}
+      .brand-sub{{font-size:.67rem;color:var(--muted)!important;line-height:1.25;margin-top:.12rem}}
+
+      .alluco-hero{{position:relative;overflow:hidden;background:linear-gradient(135deg,{theme['hero1']} 0%,{theme['hero2']} 100%);padding:1.18rem 1.35rem;border-radius:18px;margin-bottom:1rem;box-shadow:0 12px 28px rgba(21,94,239,.13)}}
+      .alluco-hero:after{{content:'';position:absolute;width:220px;height:220px;border-radius:50%;right:-80px;top:-130px;background:rgba(255,255,255,.09)}}
+      .alluco-hero *{{color:#fff!important}}.alluco-title{{font-size:1.48rem;font-weight:950;letter-spacing:-.015em}}.alluco-sub{{opacity:.91;font-size:.86rem;margin-top:.25rem;max-width:1050px}}
+
+      .erp-card{{border:1px solid var(--line);border-radius:14px;padding:.9rem 1rem;background:var(--surface);margin-bottom:.7rem;box-shadow:0 1px 3px var(--shadow)}}
+      .erp-badge{{display:inline-flex;align-items:center;padding:.28rem .55rem;border-radius:999px;background:var(--soft);color:var(--primary)!important;font-weight:850;font-size:.75rem}}
+      .erp-ok{{background:color-mix(in srgb,var(--success) 13%,var(--surface));color:var(--success)!important}}
+      .erp-warn{{background:color-mix(in srgb,var(--warning) 13%,var(--surface));color:var(--warning)!important}}
+      .erp-err{{background:color-mix(in srgb,var(--danger) 13%,var(--surface));color:var(--danger)!important}}
+
+      [data-testid="stMetric"]{{border:1px solid var(--line);border-radius:14px;padding:.68rem .85rem;background:var(--surface);box-shadow:0 1px 3px var(--shadow)}}
+      [data-testid="stMetricLabel"]{{color:var(--muted)!important}}
+      [data-testid="stDataFrame"],[data-testid="stDataEditor"]{{border:1px solid var(--line);border-radius:13px;overflow:hidden;background:var(--surface)!important}}
+      [data-baseweb="input"]>div,[data-baseweb="select"]>div,textarea,input{{background:var(--input)!important;color:var(--ink)!important;border-color:var(--line)!important}}
+      [data-baseweb="popover"],[data-baseweb="menu"],[role="listbox"]{{background:var(--surface)!important;color:var(--ink)!important}}
+      button[data-baseweb="tab"]{{font-weight:800;color:var(--muted)!important}}
+      button[data-baseweb="tab"][aria-selected="true"]{{color:var(--primary)!important}}
+      .stButton>button,.stDownloadButton>button{{border-radius:10px;font-weight:800;min-height:40px;border:1px solid var(--line);background:var(--surface);color:var(--ink)!important}}
+      .stButton>button[kind="primary"]{{background:var(--primary);border-color:var(--primary);color:#fff!important}}
+      .stButton>button[kind="primary"] *{{color:#fff!important}}
+      hr{{border-color:var(--line)!important}}
+
+      .bal-summary{{display:flex;gap:.45rem;align-items:center;flex-wrap:wrap;margin:.2rem 0 .7rem}}
+      .bal-chip{{display:inline-flex;align-items:center;gap:.28rem;border:1px solid var(--line);background:var(--surface);border-radius:999px;padding:.3rem .58rem;font-size:.75rem;font-weight:800;color:var(--ink)!important}}
+      .bal-chip strong{{color:var(--primary)!important}}
+      @media(max-width:900px){{.block-container{{padding-left:.7rem;padding-right:.7rem}}.brand-logo{{width:145px;height:54px}}.alluco-hero{{padding:1rem 1.05rem}}}}
     </style>
     """
 
@@ -1924,6 +2013,7 @@ def flash_error(exc: Exception, prefix: str = "Erreur") -> None:
 
 
 def bootstrap_admin_ui() -> None:
+    st.markdown(brand_html(bool(st.session_state.get("ui_dark_mode", False))), unsafe_allow_html=True)
     hero("Initialisation ALLUCO ERP", "Premiere utilisation: creez le compte administrateur. Aucun mot de passe n'est code dans le fichier.")
     with st.form("bootstrap_admin"):
         username = st.text_input("Utilisateur administrateur", value="admin")
@@ -1942,6 +2032,7 @@ def bootstrap_admin_ui() -> None:
 
 
 def login_ui() -> None:
+    st.markdown(brand_html(bool(st.session_state.get("ui_dark_mode", False))), unsafe_allow_html=True)
     hero("ALLUCO Industrial ERP IA", "Acces interne securise")
     with st.form("login"):
         username = st.text_input("Utilisateur")
@@ -1960,6 +2051,7 @@ def login_ui() -> None:
 
 
 def client_portal_ui() -> None:
+    st.markdown(brand_html(bool(st.session_state.get("ui_dark_mode", False))), unsafe_allow_html=True)
     hero("Suivi client", "Consultation du dernier planning publie")
     if not CLIENT_ACCESS_CODE:
         st.info("Le portail client est desactive. Configurez ALLUCO_CLIENT_ACCESS_CODE pour l'activer.")
@@ -1990,18 +2082,19 @@ def sidebar_navigation() -> str:
     role = st.session_state.get("role", "")
     username = st.session_state.get("username", "")
     with st.sidebar:
-        st.markdown("### ALLUCO")
-        st.caption("Industrial ERP IA")
-        st.markdown(f"**{esc(username)}** · `{esc(role)}`", unsafe_allow_html=True)
+        dark_mode = bool(st.session_state.get("ui_dark_mode", False))
+        st.markdown(brand_html(dark_mode, compact=True), unsafe_allow_html=True)
+        st.markdown(f"<div class='erp-badge'>{esc(username)} · {esc(role)}</div>", unsafe_allow_html=True)
+        st.toggle("Mode sombre", key="ui_dark_mode", help="Basculer entre le thème clair et le thème sombre")
         st.divider()
         options: List[Tuple[str, str]] = []
         candidates = [
             ("dashboard", "▣ Tableau de bord"), ("orders", "📋 Commandes / AX"),
-            ("planning", "🤖 Planning IA"), ("magasin", "📦 Magasin J-2"),
-            ("laquage", "🎨 Laquage"), ("quality", "✓ Qualite"),
-            ("relaquage", "↻ Re-laquage"), ("logistics", "🚚 Logistique"),
-            ("analysis", "🧠 Analyse IA"), ("notifications", "🔔 Notifications"),
-            ("admin", "⚙ Administration"),
+            ("planning", "🤖 Planning IA"), ("balancelles", "⚖️ Balancelles"),
+            ("magasin", "📦 Magasin J-2"), ("laquage", "🎨 Laquage"),
+            ("quality", "✓ Qualité"), ("relaquage", "↻ Re-laquage"),
+            ("logistics", "🚚 Logistique"), ("analysis", "🧠 Analyse IA"),
+            ("notifications", "🔔 Notifications"), ("admin", "⚙ Administration"),
         ]
         for key, label in candidates:
             if key == "admin" and role == "ADMIN":
@@ -2012,12 +2105,13 @@ def sidebar_navigation() -> str:
         selected_label = st.radio("Navigation", labels, label_visibility="collapsed") if labels else ""
         selected = next((k for k, l in options if l == selected_label), "dashboard")
         st.divider()
-        st.caption(f"Version {VERSION}")
-        if st.button("Se deconnecter", use_container_width=True):
+        st.caption(f"Version {VERSION} · SQLite")
+        if st.button("Se déconnecter", use_container_width=True):
             for k in ["user_id", "username", "role", "plan_result", "plan_signature"]:
                 st.session_state.pop(k, None)
             st.rerun()
     return selected
+
 
 # =============================================================================
 # 15. UI PAGES
@@ -2192,6 +2286,139 @@ def page_planning() -> None:
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
+
+
+def build_balancelle_register(entries: pd.DataFrame) -> pd.DataFrame:
+    """Décompose le planning officiel en balancelles opérationnelles.
+
+    Le registre privilégie la sécurité: la capacité d'une BAL provient du référentiel
+    article/famille. Si le nombre de BAL stocké dans le planning diffère du nombre
+    recalculé, les BAL restent générées sans surcharge et sont marquées « À contrôler ».
+    """
+    columns = [
+        "N° BAL", "Balancelle", "Date", "Jour", "Séquence ligne", "BAL dans ligne",
+        "Commande", "Client", "Article", "Article/int", "Couleur", "Num OF",
+        "Qté dans BAL", "Capacité BAL", "Remplissage %", "Statut", "Contenu", "Entry ID",
+    ]
+    if entries is None or entries.empty:
+        return pd.DataFrame(columns=columns)
+    rows: List[Dict[str, Any]] = []
+    per_day_counter: Dict[str, int] = defaultdict(int)
+    work = entries.copy()
+    if "planned_date" in work.columns:
+        work = work.sort_values(["planned_date", "sequence_no", "id"], na_position="last")
+    for _, r in work.iterrows():
+        planned_date = norm_text(r.get("planned_date"))
+        try:
+            d = date.fromisoformat(planned_date)
+            day_label = DAYS[d.weekday()].title() if 0 <= d.weekday() < len(DAYS) else d.strftime("%A")
+        except Exception:
+            day_label = "—"
+        article_int = norm_text(r.get("article_int"))
+        qty_total = max(0, int(math.ceil(to_float(r.get("planned_qty")) - 1e-9)))
+        cap = max(1, int(infer_bars_per_bal(article_int)))
+        expected_nbal = int(math.ceil(qty_total / cap)) if qty_total > 0 else 0
+        stored_nbal = max(0, int(round(to_float(r.get("nbre_bal")))))
+        mismatch = stored_nbal > 0 and stored_nbal != expected_nbal
+        remaining = qty_total
+        for bal_in_line in range(1, expected_nbal + 1):
+            per_day_counter[planned_date] += 1
+            qty = min(cap, remaining)
+            remaining -= qty
+            fill = round((qty / cap) * 100, 1) if cap else 0.0
+            status = "À contrôler" if mismatch else ("Complète" if qty == cap else "Partielle")
+            bal_number = per_day_counter[planned_date]
+            rows.append({
+                "N° BAL": bal_number,
+                "Balancelle": f"BAL {bal_number:03d}",
+                "Date": planned_date,
+                "Jour": day_label,
+                "Séquence ligne": int(to_float(r.get("sequence_no"), 0)),
+                "BAL dans ligne": bal_in_line,
+                "Commande": norm_text(r.get("num_commande")),
+                "Client": norm_text(r.get("nom_client")),
+                "Article": norm_text(r.get("article")),
+                "Article/int": article_int,
+                "Couleur": norm_text(r.get("couleur")),
+                "Num OF": norm_text(r.get("num_of")),
+                "Qté dans BAL": qty,
+                "Capacité BAL": cap,
+                "Remplissage %": fill,
+                "Statut": status,
+                "Contenu": f"{norm_text(r.get('num_commande')) or 'Sans commande'} · {article_int or norm_text(r.get('article'))} · {norm_text(r.get('couleur'))}",
+                "Entry ID": int(to_float(r.get("id"), 0)),
+            })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def export_balancelles_excel(df: pd.DataFrame) -> bytes:
+    out = io.BytesIO()
+    wb = Workbook(); ws = wb.active; ws.title = "Balancelles"
+    headers = list(df.columns)
+    navy, white, line = "14365A", "FFFFFF", Side(style="thin", color="D0D5DD")
+    for ci, h in enumerate(headers, 1):
+        c = ws.cell(1, ci, h); c.fill = PatternFill("solid", fgColor=navy); c.font = Font(color=white, bold=True); c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for ri, (_, row) in enumerate(df.iterrows(), 2):
+        for ci, h in enumerate(headers, 1):
+            c = ws.cell(ri, ci, row.get(h)); c.border = Border(bottom=line)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:{get_column_letter(max(1, len(headers)))}{max(1, len(df)+1)}"
+    widths = {"Balancelle": 14, "Date": 13, "Jour": 12, "Commande": 18, "Client": 25, "Article": 25, "Article/int": 18, "Couleur": 13, "Num OF": 17, "Contenu": 48}
+    for ci, h in enumerate(headers, 1): ws.column_dimensions[get_column_letter(ci)].width = widths.get(h, 14)
+    wb.save(out)
+    return out.getvalue()
+
+
+def page_balancelles() -> None:
+    hero("Balancelles", "Registre atelier BAL 001…N dérivé du planning officiel, avec capacité, remplissage et contrôle de cohérence")
+    v = current_published_version()
+    if not v:
+        st.info("Publiez d'abord un planning officiel pour générer le registre des balancelles.")
+        return
+    entries = published_entries(v["id"])
+    register = build_balancelle_register(entries)
+    if register.empty:
+        st.info("Aucune balancelle dans le planning publié.")
+        return
+
+    dates = sorted([x for x in register["Date"].dropna().astype(str).unique().tolist() if x])
+    default_date = app_today().isoformat() if app_today().isoformat() in dates else dates[0]
+    c1, c2, c3 = st.columns([1.15, 1.35, 2.2])
+    selected_date = c1.selectbox("Jour", dates, index=dates.index(default_date) if default_date in dates else 0)
+    all_colors = sorted(register["Couleur"].dropna().astype(str).unique().tolist())
+    colors = c2.multiselect("Couleurs", all_colors, default=all_colors)
+    query = c3.text_input("Recherche", placeholder="Commande, client, article, OF…")
+
+    filtered = register[register["Date"] == selected_date].copy()
+    if colors:
+        filtered = filtered[filtered["Couleur"].isin(colors)]
+    if query.strip():
+        q = query.strip().lower()
+        search_cols = ["Commande", "Client", "Article", "Article/int", "Couleur", "Num OF", "Contenu"]
+        mask = pd.Series(False, index=filtered.index)
+        for col in search_cols:
+            mask = mask | filtered[col].astype(str).str.lower().str.contains(re.escape(q), regex=True, na=False)
+        filtered = filtered[mask]
+
+    full_count = int((filtered["Statut"] == "Complète").sum()) if not filtered.empty else 0
+    partial_count = int((filtered["Statut"] == "Partielle").sum()) if not filtered.empty else 0
+    check_count = int((filtered["Statut"] == "À contrôler").sum()) if not filtered.empty else 0
+    avg_fill = float(pd.to_numeric(filtered["Remplissage %"], errors="coerce").fillna(0).mean()) if not filtered.empty else 0.0
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("BAL", len(filtered)); m2.metric("Complètes", full_count); m3.metric("Partielles", partial_count); m4.metric("À contrôler", check_count); m5.metric("Remplissage moyen", f"{avg_fill:.1f}%")
+
+    if not filtered.empty:
+        colors_txt = " · ".join(dict.fromkeys(filtered["Couleur"].astype(str).tolist()))
+        st.markdown(f"<div class='bal-summary'><span class='bal-chip'><strong>{esc(selected_date)}</strong></span><span class='bal-chip'>Couleurs: <strong>{esc(colors_txt or '—')}</strong></span><span class='bal-chip'>Planning: <strong>S{int(v['week'])}/{int(v['year'])} · V{int(v['version_no'])}</strong></span></div>", unsafe_allow_html=True)
+    display_cols = ["Balancelle", "Contenu", "Commande", "Client", "Article/int", "Couleur", "Num OF", "Qté dans BAL", "Capacité BAL", "Remplissage %", "Statut", "BAL dans ligne"]
+    st.dataframe(filtered[display_cols], hide_index=True, use_container_width=True, height=610)
+
+    if check_count:
+        st.warning(f"{check_count} BAL marquée(s) À contrôler: le Nbre BAL publié ne correspond pas au calcul Barre/bal du référentiel.")
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇ Exporter CSV", filtered[display_cols].to_csv(index=False).encode("utf-8-sig"), file_name=f"Balancelles_{selected_date}.csv", mime="text/csv", use_container_width=True)
+    c2.download_button("⬇ Exporter Excel", export_balancelles_excel(filtered[display_cols]), file_name=f"Balancelles_{selected_date}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    st.caption("Lecture: la dernière BAL d'une ligne peut être partielle. 'À contrôler' signale une incohérence entre la quantité, Nbre BAL et la capacité Barre/bal calculée.")
 
 
 def page_magasin() -> None:
@@ -2444,7 +2671,7 @@ def render_internal_app() -> None:
     nav = sidebar_navigation()
     pages = {
         "dashboard": page_dashboard, "orders": page_orders, "planning": page_planning,
-        "magasin": page_magasin, "laquage": page_laquage, "quality": page_quality,
+        "balancelles": page_balancelles, "magasin": page_magasin, "laquage": page_laquage, "quality": page_quality,
         "relaquage": page_relaquage, "logistics": page_logistics, "analysis": page_analysis,
         "notifications": page_notifications, "admin": page_admin,
     }
@@ -2457,13 +2684,21 @@ def render_app() -> None:
         raise RuntimeError("Streamlit n'est pas installe. Lancez: pip install -r requirements.txt")
     init_db()
     st.set_page_config(page_title=APP_NAME, page_icon="A", layout="wide", initial_sidebar_state="expanded")
-    st.markdown(app_css(), unsafe_allow_html=True)
-    # Portail public separe de l'espace interne; aucune donnee interne n'est montree avant authentification.
+    dark_mode = bool(st.session_state.get("ui_dark_mode", False))
+    st.markdown(app_css(dark_mode), unsafe_allow_html=True)
+
+    # Avant authentification, conserver une identité visuelle cohérente et le choix du thème.
     if not st.session_state.get("username"):
+        with st.sidebar:
+            st.markdown(brand_html(dark_mode, compact=True), unsafe_allow_html=True)
+            st.toggle("Mode sombre", key="ui_dark_mode", help="Basculer entre le thème clair et le thème sombre")
+            st.divider()
+            st.caption(f"Version {VERSION}")
         top = st.radio("Espace", ["Interne", "Portail client"], horizontal=True, label_visibility="collapsed")
         if top == "Portail client":
             client_portal_ui(); return
     render_internal_app()
+
 
 # =============================================================================
 # 17. SELF TESTS / CLI
@@ -2499,6 +2734,13 @@ def self_test() -> None:
         assert result["confidence"] == 100, result["hard_errors"]
         assert sum(len(x) for x in result["days"].values()) == 2
         assert all(x["Charge totale h"] <= 8.0 + 1e-6 for x in result["metrics"]["days"])
+        bal_test = build_balancelle_register(pd.DataFrame([{
+            "id": 1, "planned_date": "2026-10-12", "sequence_no": 1, "num_commande": "C1", "nom_client": "A",
+            "article": "EC40100-R7016", "article_int": "EC40100", "couleur": "R7016", "num_of": "OF1",
+            "planned_qty": 140, "nbre_bal": 10,
+        }]))
+        assert len(bal_test) == 10 and int(bal_test["Qté dans BAL"].sum()) == 140
+        assert set(bal_test["Statut"]) == {"Complète"}
     finally:
         load_active_orders_df = old_loader
         q_all = old_q_all
