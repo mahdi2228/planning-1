@@ -6603,7 +6603,7 @@ def _rq_refresh(message: str = "") -> None:
 # ============================================================================
 # 19) SUIVI PRO: interface, reliquats clients, corbeille et historique Supabase.
 # ============================================================================
-PRO_VERSION = '2.0.0'
+PRO_VERSION = '2.1.0'
 PRO_TABLES = {'relaquages': 'alluco_relaquages', 'reliquats': 'alluco_reliquats'}
 PRO_ENDPOINTS = {RQ_TABLE, 'rpc/' + RQ_RPC, 'alluco_reliquats',
     'alluco_relaquages_suivi', 'alluco_reliquats_suivi', 'alluco_suivi_parametres',
@@ -6737,6 +6737,10 @@ def _pro_commit(entity: str, action: str, items: Sequence[Dict[str,Any]]) -> int
         'p_entity':entity,'p_action':action,'p_records':prepared,'p_actor':admin_username()})
     if not isinstance(response,dict) or type(response.get('saved')) is not int or response['saved']!=len(items) or response.get('action')!=action:
         raise RelaquageStorageError('Confirmation incomplete: actualisez pour verifier avant de reessayer.')
+    # Confirmation de la transaction distante recue. Forcer la prochaine lecture.
+    # Aucun ajout/modification n'est enregistre uniquement dans session_state.
+    st.session_state.pop('_pro_snapshot', None)
+    st.session_state.pop('_pro_snapshot_at', None)
     return response['saved']
 
 
@@ -6771,28 +6775,54 @@ def _pro_frame(entity: str, records: Sequence[Dict[str,Any]], settings: Dict[str
 
 
 def _pro_refresh(message: str = '') -> None:
-    for key in ('_pro_snapshot','_rq_records_snapshot'):
+    for key in ('_pro_snapshot','_pro_snapshot_at','_pro_snapshot_scope','_rq_records_snapshot'):
         st.session_state.pop(key,None)
     st.session_state['_pro_flash']=message
     st.rerun()
 
 
 def _pro_notice_error(exc: Exception) -> None:
-    if isinstance(exc,(ValueError,RelaquageStorageError)):
+    # Apres une erreur distante, la prochaine execution doit relire Supabase.
+    # Une ecriture ayant pu reussir avant une coupure, aucun nouvel essai automatique.
+    if not isinstance(exc, ValueError):
+        st.session_state.pop('_pro_snapshot', None)
+        st.session_state.pop('_pro_snapshot_at', None)
+    if isinstance(exc, (ValueError, RelaquageStorageError)):
         st.error(str(exc))
     else:
-        st.error('Operation non confirmee. Actualisez avant de reessayer. Reference: '+safe_error_id(exc))
+        st.error('Operation non confirmee. Actualisez avant de reessayer. Reference: ' + safe_error_id(exc))
 
 
-def _pro_load_snapshot() -> Dict[str,Any]:
-    if '_pro_snapshot' not in st.session_state:
-        settings=_pro_settings()
-        rq=_pro_load_table(PRO_TABLES['relaquages']); rl=_pro_load_table(PRO_TABLES['reliquats'])
-        for r in rq:
-            if 'deleted_at' not in r or 'priorite' not in r: raise RelaquageStorageError('Migration PRO manquante: executez 01_schema_supabase_pro.sql.')
-        st.session_state['_pro_snapshot']={'settings':settings,'relaquages':rq,'reliquats':rl,
-            'loaded_at':app_now().strftime('%d/%m/%Y %H:%M:%S')}
-    return st.session_state['_pro_snapshot']
+def _pro_load_snapshot(force: bool = False) -> Dict[str, Any]:
+    """Supabase est la source persistante; la session ne garde qu'un cache de lecture.
+
+    Une nouvelle session/un redemarrage repart de Supabase, jamais d'une liste vide
+    sauvegardee localement. Aucun schema ni import n'est execute au demarrage.
+    """
+    _rq_require_admin()
+    url, key = _rq_supabase_config()
+    scope = hashlib.sha256((url + '|' + key + '|' + admin_username()).encode()).hexdigest()
+    cached = st.session_state.get('_pro_snapshot')
+    age = time.monotonic() - st.session_state.get('_pro_snapshot_at', float('-inf'))
+    if (not force and cached is not None and st.session_state.get('_pro_snapshot_scope') == scope
+            and 0 <= age < 60):
+        return cached
+    # On ne publie le nouveau cache qu'apres la reussite de TOUTES les lectures.
+    settings = _pro_settings()
+    data = {}
+    for entity, table in PRO_TABLES.items():
+        records = _pro_load_table(table)
+        required = set(PRO_DEFAULTS[entity]) | {'id', 'revision', 'deleted_at'}
+        for row in records:
+            if not required.issubset(row):
+                raise RelaquageStorageError('Schema Supabase incomplet : executez 01_schema_supabase_pro.sql. Aucune donnee remplacee.')
+            row['revision'] = _rq_integer(row['revision'], 'Revision Supabase', 1)
+        data[entity] = records
+    snapshot = {'settings': settings, **data, 'loaded_at': app_now().strftime('%d/%m/%Y %H:%M:%S')}
+    st.session_state['_pro_snapshot'] = snapshot
+    st.session_state['_pro_snapshot_scope'] = scope
+    st.session_state['_pro_snapshot_at'] = time.monotonic()
+    return snapshot
 
 
 def _pro_css() -> str:
@@ -6880,6 +6910,7 @@ def _pro_display_table(entity: str, frame: pd.DataFrame, height: int=430) -> Non
 
 def _pro_begin_create(entity: str, linked: Optional[Dict[str,Any]]=None) -> None:
     import uuid
+    st.session_state.pop('_pro_delete', None)
     # Retain a pending id after an uncertain network write. A second submission
     # then conflicts safely rather than creating a duplicate workshop dossier.
     context=entity+'|'+str((linked or {}).get('id',''))
@@ -6899,6 +6930,7 @@ def _pro_begin_create(entity: str, linked: Optional[Dict[str,Any]]=None) -> None
 
 
 def _pro_begin_edit(entity: str, record: Dict[str,Any]) -> None:
+    st.session_state.pop('_pro_delete', None)
     # Snapshot of the version displayed. Never refresh this revision silently.
     st.session_state['_pro_form']={'entity':entity,'record':dict(record),'mode':'update'}
 
@@ -6963,7 +6995,7 @@ def _pro_form_body() -> None:
         else:
             st.session_state.pop('_pro_form',None)
             if mode=='create': st.session_state.pop('_pro_pending_create',None)
-            _pro_refresh('Fiche ajoutee.' if mode=='create' else 'Modifications enregistrees. Les autres champs sont conserves.')
+            _pro_refresh('Fiche enregistree dans Supabase.' if mode=='create' else 'Modifications enregistrees dans Supabase. Les autres champs sont conserves.')
 
 
 def _pro_archive_body() -> None:
@@ -6986,7 +7018,7 @@ def _pro_archive_body() -> None:
             _pro_commit(entity,'archive',[{'id':r['id'],'expected_revision':r['revision'],'data':{'reason':reason}}])
         except Exception as exc: _pro_notice_error(exc)
         else:
-            st.session_state.pop('_pro_delete',None);_pro_refresh('Fiche placee dans la corbeille.')
+            st.session_state.pop('_pro_delete',None);_pro_refresh('Suppression enregistree dans Supabase. Fiche restaurable depuis la corbeille.')
 
 
 def _pro_close_form() -> None:
@@ -6997,17 +7029,31 @@ def _pro_close_delete() -> None:
     st.session_state.pop('_pro_delete',None)
 
 
-if st is not None and hasattr(st,'dialog'):
-    _pro_dialog=st.dialog('Fiche de suivi',width='large',on_dismiss=_pro_close_form)(_pro_form_body)
-    _pro_delete_dialog=st.dialog('Confirmer la suppression',on_dismiss=_pro_close_delete)(_pro_archive_body)
-else:
-    _pro_dialog=_pro_form_body
-    _pro_delete_dialog=_pro_archive_body
 
 
 def _pro_open_dialogs() -> None:
-    if st.session_state.get('_pro_delete'): _pro_delete_dialog()
-    elif st.session_state.get('_pro_form'): _pro_dialog()
+    """Dialogue recent ou formulaire dans la page, sans erreur au chargement."""
+    if st.session_state.get('_pro_delete'):
+        body, title, on_dismiss, width = _pro_archive_body, 'Confirmer la suppression', _pro_close_delete, 'small'
+    elif st.session_state.get('_pro_form'):
+        body, title, on_dismiss, width = _pro_form_body, 'Fiche de suivi', _pro_close_form, 'large'
+    else:
+        return
+    dialog = getattr(st, 'dialog', None)
+    supports_dismiss = False
+    if callable(dialog):
+        import inspect
+        try:
+            supports_dismiss = 'on_dismiss' in inspect.signature(dialog).parameters
+        except (TypeError, ValueError):
+            pass
+    if supports_dismiss:
+        dialog(title, width=width, on_dismiss=on_dismiss)(body)()
+    else:
+        # Les anciennes versions restent utilisables; aucun on_dismiss inconnu.
+        st.divider()
+        st.markdown('### ' + title)
+        body()
 
 
 def _pro_filters(entity: str, frame: pd.DataFrame) -> pd.DataFrame:
@@ -7071,41 +7117,60 @@ def _pro_inline_edits(entity: str, frame: pd.DataFrame, raw: Sequence[Dict[str,A
             else: _pro_refresh(f'{count} fiche(s) mise(s) a jour.')
 
 
-def _pro_register(entity: str, snapshot: Dict[str,Any], source: pd.DataFrame) -> None:
-    is_rq=entity=='relaquages'
-    a,b=st.columns([3,1])
-    with a: st.markdown('### Re-laquages atelier' if is_rq else '### Reliquats clients')
-    if b.button('+ Nouveau re-laquage' if is_rq else '+ Nouveau reliquat',type='primary',use_container_width=True,key='new_'+entity):
+def _pro_register(entity: str, snapshot: Dict[str, Any], source: Optional[pd.DataFrame] = None) -> None:
+    """Trois actions sur Supabase; source conserve pour compatibilite, jamais lu."""
+    is_rq = entity == 'relaquages'
+    st.markdown('### Re-laquages atelier' if is_rq else '### Reliquats clients')
+    raw = snapshot[entity]
+    frame = _pro_frame(entity, raw, snapshot['settings'])
+    filtered = _pro_filters(entity, frame)
+    rows = {r['id']: r for r in raw}
+    record = None
+    if not filtered.empty:
+        ids = filtered['id'].tolist()
+        select_key = 'select_' + entity
+        if st.session_state.get(select_key) not in ids:
+            st.session_state.pop(select_key, None)
+        def label(rid):
+            r = rows[rid]
+            return ' | '.join([r.get('commande') or 'Sans commande', r['article'],
+                               r.get('couleur') or '', r.get('num_of') or 'Sans OF', rid[-6:]])
+        selected = st.selectbox('Fiche à modifier ou supprimer', ids, format_func=label, key=select_key)
+        record = rows[selected]
+    elif frame.empty:
+        st.caption('Commencez par Ajouter pour créer votre première fiche dans Supabase.')
+    else:
+        st.caption('Aucune fiche ne correspond aux filtres. Effacez la recherche ou ajustez les filtres.')
+
+    add_col, edit_col, delete_col = st.columns(3)
+    if add_col.button('Ajouter', type='primary', use_container_width=True, key='new_' + entity):
         _pro_begin_create(entity)
-    raw=snapshot[entity]
-    frame=_pro_frame(entity,raw,snapshot['settings'])
-    filtered=_pro_filters(entity,frame)
-    _pro_kpis(entity,filtered)
-    st.markdown("<div class='rq-legend'><span class='rq-pill rq-red'>RETARD CRITIQUE</span><span class='rq-pill rq-amber'>EN ATTENTE / ECHEANCE</span><span class='rq-pill rq-green'>SOLDE / TERMINE</span><span class='rq-pill rq-purple'>URGENT</span></div>",unsafe_allow_html=True)
-    _pro_display_table(entity,filtered)
+    if edit_col.button('Modifier', disabled=record is None, use_container_width=True, key='edit_' + entity):
+        _pro_begin_edit(entity, record)
+    if delete_col.button('Supprimer', disabled=record is None, use_container_width=True, key='delete_' + entity):
+        st.session_state.pop('_pro_form', None)
+        st.session_state['_pro_delete'] = {'entity': entity, 'record': dict(record)}
+    st.caption('Ajouter : nouvelle fiche. Modifier : fiche sélectionnée. Supprimer : confirmation puis corbeille.')
+    _pro_kpis(entity, filtered)
+    st.markdown("<div class='rq-legend'><span class='rq-pill rq-red'>RETARD CRITIQUE</span><span class='rq-pill rq-amber'>EN ATTENTE / ECHEANCE</span><span class='rq-pill rq-green'>SOLDE / TERMINE</span><span class='rq-pill rq-purple'>URGENT</span></div>", unsafe_allow_html=True)
+    _pro_display_table(entity, filtered)
     if not is_rq:
         st.caption('Temps Depasse = jours calendaires depuis la creation, et non un retard sur une date de livraison contractuelle. Non-service = reste a livrer / commande. Lancement reste independant.')
-    if not filtered.empty:
-        rows={r['id']:r for r in raw}
-        def label(rid):
-            r=rows[rid]
-            return ' | '.join([r.get('commande') or 'Sans commande',r['article'],r.get('num_of') or 'Sans OF',rid[-6:]])
-        selected=st.selectbox('Choisir une fiche pour modifier ou supprimer',filtered['id'].tolist(),format_func=label,key='select_'+entity)
-        record=rows[selected]
-        a,b,c=st.columns(3)
-        if a.button('Modifier la fiche',key='edit_'+entity,use_container_width=True): _pro_begin_edit(entity,record)
-        if b.button('Supprimer',key='delete_'+entity,use_container_width=True): st.session_state['_pro_delete']={'entity':entity,'record':dict(record)}
+    if record is not None:
         if not is_rq:
-            if c.button('Creer un re-laquage lie',key='linked_'+entity,use_container_width=True): _pro_begin_create('relaquages',record)
+            if st.button('Creer un re-laquage lie', key='linked_' + entity):
+                _pro_begin_create('relaquages', record)
         else:
-            remaining=int(record['quantite'])-int(record['realise'])
-            with c: st.caption(f"{remaining} piece(s) restante(s) | revision {record['revision']}")
+            remaining = int(record['quantite']) - int(record['realise'])
+            st.caption(f"{remaining} piece(s) restante(s) | revision {record['revision']}")
         with st.expander('Details de la fiche selectionnee'):
-            st.write('**Responsable :** '+(record.get('responsable') or 'Non affecte'))
-            st.write('**Commentaire :** '+(record.get('commentaire') or 'Aucun'))
-            st.caption('Derniere modification: '+_rq_text(record.get('updated_at'))+' | '+_rq_text(record.get('updated_by')))
-            if record.get('reliquat_id'): st.caption('Lien reliquat: '+record['reliquat_id'])
-        _pro_inline_edits(entity,filtered,raw)
+            st.write('**Responsable :** ' + (record.get('responsable') or 'Non affecte'))
+            st.write('**Commentaire :** ' + (record.get('commentaire') or 'Aucun'))
+            st.caption('Identifiant : ' + record['id'])
+            st.caption('Derniere modification: ' + _rq_text(record.get('updated_at')) + ' | ' + _rq_text(record.get('updated_by')))
+            if record.get('reliquat_id'):
+                st.caption('Lien reliquat: ' + record['reliquat_id'])
+        _pro_inline_edits(entity, filtered, raw)
 
 
 def _pro_dashboard(snapshot: Dict[str,Any]) -> None:
@@ -7131,7 +7196,7 @@ def _pro_dashboard(snapshot: Dict[str,Any]) -> None:
             st.markdown('#### A traiter en priorite')
             _pro_display_table('relaquages',critical.sort_values('anciennete_jours',ascending=False).head(10),330)
     else:
-        st.info('Aucun re-laquage enregistre. Ouvrez Re-laquages puis Nouveau re-laquage pour creer une fiche atelier.')
+        st.info('Aucun re-laquage enregistre. Ouvrez Re-laquages puis Ajouter pour creer une fiche atelier.')
     st.markdown('### Clients | Reliquats')
     _pro_kpis('reliquats',rl)
     if not rl.empty:
@@ -7223,45 +7288,62 @@ def _pro_settings_ui(snapshot: Dict[str,Any]) -> None:
 
 
 def render_suivi_relaquage(source: Optional[pd.DataFrame] = None) -> None:
-    # Signature conservee; ce suivi ne lit jamais la base Excel du planning.
-    source=pd.DataFrame()
-    st.markdown(_pro_css(),unsafe_allow_html=True)
-    st.markdown("<div class='rq-hero'><div><div class='rq-eyebrow'>ALLUCO / PILOTAGE ATELIER</div><h2>Re-laquage &amp; reliquats</h2><p>Des priorites visibles, des fiches simples et un historique conserve. Le planning reste independant.</p></div><div class='rq-live'>SUPABASE / PRO "+PRO_VERSION+"</div></div>",unsafe_allow_html=True)
+    # Le parametre historique est ignore: aucun acces au classeur du planning.
+    st.markdown(_pro_css(), unsafe_allow_html=True)
+    st.markdown("<div class='rq-hero'><div><div class='rq-eyebrow'>ALLUCO / PILOTAGE ATELIER</div><h2>Re-laquage &amp; reliquats</h2><p>Ajouter, modifier, supprimer. Les fiches enregistrees restent dans Supabase, meme apres redemarrage. Le planning reste independant.</p></div><div class='rq-live'>SUPABASE / PRO " + PRO_VERSION + "</div></div>", unsafe_allow_html=True)
     try:
-        _rq_require_admin();url,key=_rq_supabase_config()
+        _rq_require_admin()
+        url, key = _rq_supabase_config()
     except RelaquageStorageError as exc:
         st.warning(str(exc))
         st.markdown('Executez **01_schema_supabase_pro.sql**, puis renseignez les secrets Streamlit **SUPABASE_URL**, **SUPABASE_SECRET_KEY** et un mot de passe administrateur personnel.')
         st.caption('La cle secrete reste sur le serveur. Pas de fichier Excel pour ce suivi.')
         return
-    scope=hashlib.sha256((url+'|'+key+'|'+admin_username()).encode()).hexdigest()
-    if st.session_state.get('_pro_scope')!=scope:
+    scope = hashlib.sha256((url + '|' + key + '|' + admin_username()).encode()).hexdigest()
+    if st.session_state.get('_pro_scope') != scope:
         for name in list(st.session_state):
-            if name.startswith('_pro_'): st.session_state.pop(name,None)
-        st.session_state['_pro_scope']=scope
-    a,b=st.columns([5,1])
-    with a: st.caption('Date de calcul: '+app_today().strftime('%d/%m/%Y')+' | Fuseau Africa/Tunis | Suivi partage, sans stockage Excel')
-    if b.button('Actualiser',use_container_width=True,key='pro_refresh'):
-        st.session_state.pop('_pro_form',None);st.session_state.pop('_pro_delete',None)
+            if name.startswith('_pro_'):
+                st.session_state.pop(name, None)
+        st.session_state['_pro_scope'] = scope
+    a, b = st.columns([5, 1])
+    with a:
+        st.caption('Date de calcul : ' + app_today().strftime('%d/%m/%Y') + ' | Fuseau Africa/Tunis | Suivi partage, sans stockage Excel')
+    if b.button('Actualiser', use_container_width=True, key='pro_refresh'):
+        st.session_state.pop('_pro_form', None)
+        st.session_state.pop('_pro_delete', None)
         _pro_refresh()
-    flash=st.session_state.pop('_pro_flash','')
-    if flash: st.success(flash)
-    try: snapshot=_pro_load_snapshot()
+    try:
+        snapshot = _pro_load_snapshot()
     except Exception as exc:
-        _pro_notice_error(exc);st.caption('Aucune donnee existante n\'a ete remplacee par une base vide.');return
-    st.caption('Derniere lecture Supabase: '+snapshot['loaded_at']+' | Actualisez avant toute reprise apres une erreur reseau.')
-    # An uncertain creation is reconciled by id after refresh, never duplicated.
-    pending=st.session_state.get('_pro_pending_create',{})
-    if pending and any(r['id']==pending['id'] for e in PRO_TABLES for r in snapshot[e]):
-        st.session_state.pop('_pro_pending_create',None)
+        _pro_notice_error(exc)
+        st.caption('Lecture non confirmee. Aucune donnee existante n’a ete remplacee par une base vide.')
+        return
+    st.caption('Projet Supabase : ' + url + ' | Derniere lecture reussie : ' + snapshot['loaded_at'])
+    st.info('Apres Ajouter ou Modifier, validez le formulaire et attendez la confirmation Supabase. Les fiches enregistrees sont conservees apres reboot ; une saisie non enregistree ne l’est pas.')
+    flash = st.session_state.pop('_pro_flash', '')
+    if flash:
+        st.success(flash)
+    pending = st.session_state.get('_pro_pending_create', {})
+    if pending and any(r['id'] == pending['id'] for entity in PRO_TABLES for r in snapshot[entity]):
+        st.session_state.pop('_pro_pending_create', None)
+        state = st.session_state.get('_pro_form', {})
+        if state.get('mode') == 'create' and state.get('record', {}).get('id') == pending['id']:
+            st.session_state.pop('_pro_form', None)
         st.success('La derniere fiche ajoutee est bien presente dans Supabase.')
-    nav=st.radio('Navigation du suivi',PRO_NAV,horizontal=True,key='pro_nav',label_visibility='collapsed')
-    if nav=='Tableau de bord': _pro_dashboard(snapshot)
-    elif nav=='Re-laquages': _pro_register('relaquages',snapshot,source)
-    elif nav=='Reliquats clients': _pro_register('reliquats',snapshot,source)
-    elif nav=='Corbeille': _pro_trash(snapshot)
-    elif nav=='Historique': _pro_history()
-    else: _pro_settings_ui(snapshot)
+    nav = st.radio('Navigation du suivi', PRO_NAV, index=PRO_NAV.index('Re-laquages'),
+                   horizontal=True, key='pro_nav', label_visibility='collapsed')
+    if nav == 'Tableau de bord':
+        _pro_dashboard(snapshot)
+    elif nav == 'Re-laquages':
+        _pro_register('relaquages', snapshot)
+    elif nav == 'Reliquats clients':
+        _pro_register('reliquats', snapshot)
+    elif nav == 'Corbeille':
+        _pro_trash(snapshot)
+    elif nav == 'Historique':
+        _pro_history()
+    else:
+        _pro_settings_ui(snapshot)
     _pro_open_dialogs()
 if __name__ == "__main__":
     if "--hash-password" in sys.argv:
