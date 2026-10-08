@@ -13,7 +13,7 @@ Contraintes:
 - Supabase est la source persistante ERP en production.
 - L'Excel AX est une source externe dynamique; il ne remplace jamais l'historique ERP.
 - Le coeur planning reste deterministe: regles + calculs + OR-Tools/fallback.
-- Les secrets ne sont jamais codes en dur.
+- Les cles Supabase ne sont jamais codees en dur. Le compte Admin local a un identifiant par defaut configurable via Streamlit Secrets.
 
 Lancement:
     pip install -r requirements.txt
@@ -22,13 +22,14 @@ Lancement:
 Tests locaux sans Supabase:
     python alluco_erp.py --self-test
 
-Creation initiale du premier administrateur Supabase:
-    python alluco_erp.py --create-admin admin@entreprise.tld "Nom Administrateur"
+Authentification:
+    ADMIN par defaut: utilisateur Admin / mot de passe admin123++
+    En production, ADMIN_USER et ADMIN_PASSWORD peuvent etre definis dans Streamlit Secrets.
+    Le portail client est public et ne demande ni e-mail ni mot de passe.
 """
 from __future__ import annotations
 
 import base64
-import getpass
 import hashlib
 import html
 import io
@@ -92,7 +93,7 @@ except Exception:
 # =============================================================================
 # 01. CONFIGURATION
 # =============================================================================
-VERSION = "8.2.0-SUPABASE"
+VERSION = "8.2.1-SIMPLE-AUTH"
 APP_NAME = "ALLUCO - Industrial ERP IA"
 APP_SUBTITLE = "Planning · Balancelles · Magasin · Laquage · Qualite · Logistique"
 ROOT_DIR = Path(__file__).resolve().parent
@@ -127,6 +128,12 @@ SUPABASE_URL = secret_value("SUPABASE_URL")
 SUPABASE_PUBLISHABLE_KEY = secret_value("SUPABASE_PUBLISHABLE_KEY", secret_value("SUPABASE_ANON_KEY"))
 SUPABASE_SECRET_KEY = secret_value("SUPABASE_SECRET_KEY", secret_value("SUPABASE_SERVICE_ROLE_KEY"))
 AX_EXCEL_URL = secret_value("AX_EXCEL_URL")
+
+# Authentification simple demandee pour l administrateur.
+# Les secrets Streamlit, s ils existent, remplacent ces valeurs par defaut.
+ADMIN_USERNAME = secret_value("ADMIN_USER", "Admin")
+ADMIN_PASSWORD = secret_value("ADMIN_PASSWORD", "admin123++")
+STAFF_ROLES = ["MAGASIN", "LAQUAGE", "LOGISTIQUE"]
 AX_HTTP_TIMEOUT = max(5, int(secret_value("AX_HTTP_TIMEOUT", "25") or 25))
 AX_MAX_BYTES = max(1_000_000, int(secret_value("AX_MAX_BYTES", str(60 * 1024 * 1024)) or (60 * 1024 * 1024)))
 
@@ -144,10 +151,7 @@ DEFAULT_TARGET_UTIL = 0.94
 DEFAULT_SOLVER_SECONDS = 12.0
 HARD_MAX_COLORS_PER_DAY = 4  # A CONFIRMER METIER
 
-ROLES = [
-    "ADMIN", "DIRECTION", "PLANNING", "MAGASIN", "LAQUAGE",
-    "QUALITE", "LOGISTIQUE", "COMMERCIAL", "CLIENT",
-]
+ROLES = ["ADMIN", "MAGASIN", "LAQUAGE", "LOGISTIQUE", "CLIENT"]
 ORDER_STATUSES = [
     "A_PLANIFIER", "PLANIFIE", "MATIERE_A_PREPARER", "MATIERE_PRETE",
     "EN_COURS_LAQUAGE", "LAQUAGE_TERMINE", "CONTROLE_QUALITE", "CONFORME",
@@ -645,17 +649,15 @@ def set_setting(key: str, value: Any, actor: Optional[Dict[str, Any]] = None) ->
 # 04. AUTHENTIFICATION / RBAC
 # =============================================================================
 def role_can(role: str, area: str) -> bool:
+    """RBAC strict: ADMIN voit tout; chaque service voit uniquement son module."""
     role = norm_text(role).upper()
+    area = norm_text(area).lower()
     if role == "ADMIN":
         return True
     matrix = {
-        "DIRECTION": {"dashboard", "balancelles", "analysis", "kpi", "notifications", "orders", "clients", "stock", "powder"},
-        "PLANNING": {"dashboard", "planning", "balancelles", "analysis", "notifications", "orders", "stock", "powder"},
-        "MAGASIN": {"dashboard", "magasin", "stock", "powder", "notifications"},
-        "LAQUAGE": {"dashboard", "balancelles", "laquage", "notifications"},
-        "QUALITE": {"dashboard", "quality", "relaquage", "notifications", "analysis"},
-        "LOGISTIQUE": {"dashboard", "logistics", "notifications"},
-        "COMMERCIAL": {"dashboard", "orders", "clients", "notifications"},
+        "MAGASIN": {"magasin"},
+        "LAQUAGE": {"laquage"},
+        "LOGISTIQUE": {"logistics"},
         "CLIENT": {"client"},
     }
     return area in matrix.get(role, set())
@@ -672,6 +674,35 @@ def actor_name(actor: Optional[Dict[str, Any]]) -> str:
 
 def actor_role(actor: Optional[Dict[str, Any]]) -> str:
     return norm_text((actor or {}).get("role")).upper() or "SYSTEM"
+
+
+def local_admin_profile() -> Dict[str, Any]:
+    return {
+        "id": None,
+        "auth_user_id": None,
+        "email": "",
+        "full_name": ADMIN_USERNAME or "Admin",
+        "role": "ADMIN",
+        "active": True,
+        "customer_id": None,
+        "auth_type": "LOCAL_ADMIN",
+    }
+
+
+def is_local_admin_profile(profile: Optional[Dict[str, Any]]) -> bool:
+    return bool(profile and profile.get("auth_type") == "LOCAL_ADMIN" and actor_role(profile) == "ADMIN")
+
+
+def login_local_admin(username: str, password: str) -> Optional[Dict[str, Any]]:
+    if norm_text(username) == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        profile = local_admin_profile()
+        if st is not None:
+            st.session_state["profile"] = profile
+            st.session_state["portal_mode"] = "INTERNE"
+            st.session_state["local_admin_authenticated"] = True
+        audit(profile, "LOGIN", "auth", "LOCAL_ADMIN", None, {"portal": "INTERNE", "mode": "local_admin"})
+        return profile
+    return None
 
 
 def profile_by_auth_user(auth_user_id: str) -> Optional[Dict[str, Any]]:
@@ -772,8 +803,8 @@ def login_supabase(email: str, password: str, expected_portal: str) -> Dict[str,
         raise PermissionError("Compte ERP inactif ou non configure.")
     if expected_portal == "CLIENT" and profile.get("role") != "CLIENT":
         raise PermissionError("Ce compte n'est pas un compte client.")
-    if expected_portal == "INTERNE" and profile.get("role") == "CLIENT":
-        raise PermissionError("Utilisez l'Espace Client avec ce compte.")
+    if expected_portal == "INTERNE" and norm_text(profile.get("role")).upper() not in STAFF_ROLES:
+        raise PermissionError("Ce compte n'est pas autorise dans l'espace interne.")
     if st is not None:
         st.session_state["auth_access_token"] = access_token
         st.session_state["auth_refresh_token"] = refresh_token
@@ -787,6 +818,8 @@ def restore_session() -> Optional[Dict[str, Any]]:
     if st is None:
         return None
     profile = st.session_state.get("profile")
+    if is_local_admin_profile(profile) and st.session_state.get("local_admin_authenticated"):
+        return dict(profile)
     access = st.session_state.get("auth_access_token")
     refresh = st.session_state.get("auth_refresh_token")
     if not access or not refresh:
@@ -816,7 +849,7 @@ def restore_session() -> Optional[Dict[str, Any]]:
 def logout_local() -> None:
     if st is None:
         return
-    for key in ["auth_access_token", "auth_refresh_token", "profile", "plan_result", "portal_mode"]:
+    for key in ["auth_access_token", "auth_refresh_token", "profile", "plan_result", "portal_mode", "local_admin_authenticated"]:
         st.session_state.pop(key, None)
 
 
@@ -2302,28 +2335,29 @@ def clear_login_failures() -> None:
     st.session_state.pop("login_locked_until", None)
 
 
-def login_ui(portal: str) -> None:
+def login_ui() -> None:
+    """Connexion interne: Admin local ou comptes service Supabase."""
     dark = bool(st.session_state.get("ui_dark_mode", False))
     st.markdown(brand_html(dark), unsafe_allow_html=True)
-    title = "Espace Administration" if portal == "INTERNE" else "Espace Client"
-    subtitle = "Accès interne sécurisé" if portal == "INTERNE" else "Suivi sécurisé de vos commandes ALLUCO"
-    hero(title, subtitle)
+    hero("Espace Administration", "Admin ou compte service ALLUCO")
     wait = login_wait_seconds()
     if wait > 0:
-        st.warning(f"Trop de tentatives. Réessayez dans {wait} seconde(s).")
+        st.warning(f"Trop de tentatives. Reessayez dans {wait} seconde(s).")
         return
-    with st.form(f"login_{portal}"):
-        email = st.text_input("E-mail")
+    with st.form("login_interne"):
+        username = st.text_input("Utilisateur / e-mail", placeholder="Admin ou utilisateur@entreprise.tld")
         password = st.text_input("Mot de passe", type="password")
         submit = st.form_submit_button("Se connecter", type="primary", use_container_width=True)
     if submit:
         try:
-            login_supabase(email, password, portal)
+            profile = login_local_admin(username, password)
+            if profile is None:
+                login_supabase(username, password, "INTERNE")
             clear_login_failures()
             st.rerun()
         except Exception as exc:
             register_login_failure()
-            st.error(str(exc) if isinstance(exc, (ValueError, PermissionError)) else f"Connexion impossible. Référence: {safe_error_id(exc)}")
+            st.error(str(exc) if isinstance(exc, (ValueError, PermissionError)) else f"Connexion impossible. Reference: {safe_error_id(exc)}")
 
 
 def setup_required_ui(missing: Optional[List[str]] = None) -> None:
@@ -2332,7 +2366,8 @@ def setup_required_ui(missing: Optional[List[str]] = None) -> None:
     if not SUPABASE_LIBRARY_AVAILABLE: st.error("La bibliothèque `supabase` n'est pas installée. Lancez `pip install -r requirements.txt`.")
     elif not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY or not SUPABASE_SECRET_KEY:
         st.error("Secrets Supabase incomplets.")
-        st.code("SUPABASE_URL\nSUPABASE_PUBLISHABLE_KEY\nSUPABASE_SECRET_KEY\nAX_EXCEL_URL  # optionnel mais recommandé")
+        st.code("SUPABASE_URL\nSUPABASE_PUBLISHABLE_KEY\nSUPABASE_SECRET_KEY\nAX_EXCEL_URL  # optionnel mais recommande")
+        st.caption("Le compte Admin est local a l'application, mais Supabase reste obligatoire pour les donnees ERP.")
     elif missing:
         st.error("Le schéma Supabase n'est pas initialisé ou incomplet.")
         st.write("Tables manquantes:", ", ".join(missing))
@@ -2399,6 +2434,7 @@ def maybe_auto_sync_ax(profile: Dict[str, Any]) -> None:
 # 17. UI PAGES - DASHBOARD / DATA / PLANNING
 # =============================================================================
 def page_dashboard() -> None:
+    require_area("dashboard")
     hero("Tableau de bord", "Vue opérationnelle ALLUCO — données persistantes Supabase")
     k = dashboard_kpis(); c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Commandes actives", k["orders"]); c2.metric("En retard", k["overdue"]); c3.metric("Magasin bloqué", k["blocked"])
@@ -2756,17 +2792,16 @@ def page_admin() -> None:
     profile = require_area("admin"); hero("Administration", "Utilisateurs Supabase Auth, paramètres, audit et état système")
     tab_users, tab_settings, tab_audit, tab_system = st.tabs(["Utilisateurs", "Paramètres", "Audit", "Système"])
     with tab_users:
-        customers = pd.DataFrame(sb_select("customers", filters=[("active", "eq", True)], order=[("name", False)], paginate=True))
+        st.info("Le compte Admin est integre a l'application. Ici, vous creez uniquement les comptes MAGASIN, LAQUAGE et LOGISTIQUE.")
         with st.form("new_user"):
-            c1, c2 = st.columns(2); email = c1.text_input("E-mail"); full_name = c2.text_input("Nom complet")
-            c3, c4 = st.columns(2); role = c3.selectbox("Rôle", ROLES); password = c4.text_input("Mot de passe initial", type="password")
-            customer_labels = {"- Aucun -": None}
-            if not customers.empty: customer_labels.update({str(r["name"]): str(r["id"]) for _, r in customers.iterrows()})
-            customer_sel = st.selectbox("Client lié (obligatoire uniquement pour rôle CLIENT)", list(customer_labels.keys()))
+            c1, c2 = st.columns(2); email = c1.text_input("E-mail du service"); full_name = c2.text_input("Nom complet")
+            c3, c4 = st.columns(2); role = c3.selectbox("Role", STAFF_ROLES); password = c4.text_input("Mot de passe initial", type="password")
             if st.form_submit_button("Créer utilisateur", type="primary"):
-                try: create_user_supabase(email, password, full_name, role, profile, customer_labels[customer_sel]); st.success("Utilisateur créé dans Supabase Auth."); st.rerun()
+                try: create_user_supabase(email, password, full_name, role, profile, None); st.success("Utilisateur service créé dans Supabase Auth."); st.rerun()
                 except Exception as exc: st.error(str(exc))
         users = profiles_df()
+        if not users.empty and "role" in users.columns:
+            users = users[users["role"].astype(str).str.upper().isin(STAFF_ROLES)].copy()
         if not users.empty:
             st.dataframe(users[[c for c in ["id", "email", "full_name", "role", "active", "customer_id", "created_at"] if c in users.columns]], hide_index=True, use_container_width=True)
             labels = {f"{r.get('email')} · {r.get('role')} · {'actif' if r.get('active') else 'inactif'}": str(r["id"]) for _, r in users.iterrows()}; sel = st.selectbox("Compte à activer/désactiver", list(labels.keys())); row = users[users["id"].astype(str) == labels[sel]].iloc[0]
@@ -2802,40 +2837,65 @@ def page_admin() -> None:
 # =============================================================================
 # 20. PORTAIL CLIENT
 # =============================================================================
-def client_portal_ui(profile: Dict[str, Any]) -> None:
-    if actor_role(profile) != "CLIENT": raise PermissionError("Portail réservé aux comptes CLIENT.")
-    customer_id = norm_text(profile.get("customer_id"))
+def client_portal_ui() -> None:
+    """Portail public sans compte: recherche exacte par numero de commande.
+
+    Pour limiter l'exposition sans authentification, aucune liste globale n'est affichee
+    et seules des informations client non sensibles sont retournees.
+    """
     dark = bool(st.session_state.get("ui_dark_mode", False))
     with st.sidebar:
-        st.markdown(brand_html(dark, compact=True), unsafe_allow_html=True); st.toggle("Mode sombre", key="ui_dark_mode"); st.markdown(f"**{esc(profile.get('full_name') or profile.get('email'))}**")
-        if st.button("Se déconnecter", use_container_width=True): logout_local(); st.rerun()
+        st.markdown(brand_html(dark, compact=True), unsafe_allow_html=True)
+        st.toggle("Mode sombre", key="ui_dark_mode")
         st.caption(f"Version {VERSION}")
-    st.markdown(brand_html(dark), unsafe_allow_html=True); hero("Suivi de vos commandes", "Informations validées uniquement — aucune donnée interne ALLUCO n'est exposée")
-    if not customer_id:
-        st.error("Votre compte client n'est pas encore lié à une fiche client. Contactez ALLUCO."); return
-    customer = sb_one("customers", [("id", "eq", customer_id)])
-    if customer: st.caption(f"Client: {customer.get('name')}")
-    orders = pd.DataFrame(sb_select("order_lines", filters=[("active", "eq", True), ("customer_id", "eq", customer_id)], order=[("date_livraison", False)], paginate=True))
-    query = st.text_input("Rechercher une commande", placeholder="Ex. CMD500")
-    if not orders.empty and query.strip(): orders = orders[orders["num_commande"].astype(str).str.contains(re.escape(query.strip()), case=False, na=False)]
-    if orders.empty: st.info("Aucune commande active trouvée pour votre compte.")
-    else:
-        safe_cols = [c for c in ["num_commande", "article", "article_int", "couleur", "qte_commandee", "reste_a_livrer", "date_livraison", "erp_status"] if c in orders.columns]
-        st.dataframe(orders[safe_cols], hide_index=True, use_container_width=True, height=430)
-    v = current_published_version()
-    if v:
-        entries = published_entries(v["id"])
-        if not entries.empty:
-            mine = entries[entries["customer_id"].astype(str) == customer_id].copy()
-            if not mine.empty:
-                st.markdown("#### Planning / avancement validé")
-                safe = [c for c in ["num_commande", "article_int", "couleur", "planned_date", "planned_qty", "status"] if c in mine.columns]
-                st.dataframe(mine[safe], hide_index=True, use_container_width=True)
-    shipments = pd.DataFrame(sb_select("shipments", filters=[("customer_id", "eq", customer_id)], order=[("created_at", True)], limit=200))
-    if not shipments.empty:
-        st.markdown("#### Expéditions")
-        safe_ship = [c for c in ["num_commande", "destination", "status", "created_at", "updated_at"] if c in shipments.columns]
-        st.dataframe(shipments[safe_ship], hide_index=True, use_container_width=True)
+    st.markdown(brand_html(dark), unsafe_allow_html=True)
+    hero("Espace Client", "Suivi direct de commande - aucun e-mail ni mot de passe")
+    st.info("Saisissez exactement votre numero de commande. Aucune liste de clients ou de commandes n'est publique.")
+    command = norm_text(st.text_input("Numero de commande", placeholder="Ex. CMD500")).upper()
+    if not command:
+        return
+    if len(command) < 3:
+        st.warning("Numero de commande trop court.")
+        return
+    try:
+        rows = sb_select(
+            "order_lines",
+            filters=[("active", "eq", True), ("num_commande", "eq", command)],
+            order=[("updated_at", True)],
+            limit=100,
+        )
+        orders = pd.DataFrame(rows)
+        if orders.empty:
+            st.warning("Commande introuvable.")
+            return
+
+        st.success(f"Commande {command} trouvee")
+        safe_cols = [c for c in [
+            "num_commande", "article", "article_int", "couleur",
+            "qte_commandee", "reste_a_livrer", "date_livraison", "erp_status"
+        ] if c in orders.columns]
+        st.dataframe(orders[safe_cols], hide_index=True, use_container_width=True)
+
+        v = current_published_version()
+        if v:
+            entries = published_entries(v["id"])
+            if not entries.empty and "num_commande" in entries.columns:
+                mine = entries[entries["num_commande"].astype(str).str.upper() == command].copy()
+                if not mine.empty:
+                    st.markdown("#### Planning / avancement")
+                    safe = [c for c in ["num_commande", "article_int", "couleur", "planned_date", "planned_qty", "status"] if c in mine.columns]
+                    st.dataframe(mine[safe], hide_index=True, use_container_width=True)
+
+        shipments = pd.DataFrame(sb_select(
+            "shipments", filters=[("num_commande", "eq", command)], order=[("created_at", True)], limit=50
+        ))
+        if not shipments.empty:
+            st.markdown("#### Expedition / livraison")
+            safe_ship = [c for c in ["num_commande", "destination", "status", "created_at", "updated_at"] if c in shipments.columns]
+            st.dataframe(shipments[safe_ship], hide_index=True, use_container_width=True)
+    except Exception as exc:
+        flash_error(exc, "Recherche client impossible")
+
 
 # =============================================================================
 # 21. APP ROUTER
@@ -2849,49 +2909,65 @@ def render_internal_app(profile: Dict[str, Any]) -> None:
         "quality": page_quality, "relaquage": page_relaquage, "logistics": page_logistics, "kpi": page_kpi,
         "analysis": page_analysis, "notifications": page_notifications, "admin": page_admin,
     }
-    pages.get(nav, page_dashboard)()
+    fn = pages.get(nav)
+    if fn is None:
+        st.error("Aucun module autorise pour ce compte.")
+        return
+    fn()
 
 
 def render_app() -> None:
-    if st is None: raise RuntimeError("Streamlit n'est pas installé. Lancez: pip install -r requirements.txt")
+    if st is None:
+        raise RuntimeError("Streamlit n'est pas installe. Lancez: pip install -r requirements.txt")
     st.set_page_config(page_title=APP_NAME, page_icon="A", layout="wide", initial_sidebar_state="expanded")
-    dark_mode = bool(st.session_state.get("ui_dark_mode", False)); st.markdown(app_css(dark_mode), unsafe_allow_html=True)
+    dark_mode = bool(st.session_state.get("ui_dark_mode", False))
+    st.markdown(app_css(dark_mode), unsafe_allow_html=True)
+
     if not supabase_configured(True):
         with st.sidebar:
-            st.markdown(brand_html(dark_mode, compact=True), unsafe_allow_html=True); st.toggle("Mode sombre", key="ui_dark_mode"); st.caption(f"Version {VERSION}")
-        setup_required_ui(); return
+            st.markdown(brand_html(dark_mode, compact=True), unsafe_allow_html=True)
+            st.toggle("Mode sombre", key="ui_dark_mode")
+            st.caption(f"Version {VERSION}")
+        setup_required_ui()
+        return
+
     if not st.session_state.get("schema_checked"):
         try:
-            ok, missing = validate_supabase_schema(); st.session_state["schema_checked"] = ok
+            ok, missing = validate_supabase_schema()
+            st.session_state["schema_checked"] = ok
             if not ok:
-                setup_required_ui(missing); return
-        except Exception as exc:
-            LOGGER.exception("Supabase indisponible")
-            hero("Service temporairement indisponible", "Aucune base locale vide n'a été créée. Vos données restent dans Supabase.")
-            st.error(f"Connexion Supabase impossible. Référence: {safe_error_id(exc)}"); return
-    profile = restore_session()
-    if profile:
-        portal = st.session_state.get("portal_mode", "CLIENT" if actor_role(profile) == "CLIENT" else "INTERNE")
-        if portal == "CLIENT" or actor_role(profile) == "CLIENT": client_portal_ui(profile)
-        else: render_internal_app(profile)
-        return
-    with st.sidebar:
-        st.markdown(brand_html(dark_mode, compact=True), unsafe_allow_html=True); st.toggle("Mode sombre", key="ui_dark_mode"); st.divider(); st.caption(f"Version {VERSION}")
-    st.markdown("<div class='portal-choice'>", unsafe_allow_html=True)
-    portal_label = st.radio("Choisissez votre espace", ["Administration", "Espace Client"], horizontal=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-    if portal_label == "Administration":
-        try:
-            if not admin_exists():
-                st.markdown(brand_html(dark_mode), unsafe_allow_html=True); hero("Premier administrateur à créer", "Cette opération se fait une seule fois dans Supabase et ne sera jamais redemandée après reboot/redeploy.")
-                st.code('python alluco_erp.py --create-admin admin@entreprise.tld "Nom Administrateur"')
-                st.info("Le mot de passe est demandé de façon interactive dans le terminal et n'est pas écrit dans le code.")
+                setup_required_ui(missing)
                 return
         except Exception as exc:
-            flash_error(exc, "Vérification administrateur impossible"); return
-        login_ui("INTERNE")
+            LOGGER.exception("Supabase indisponible")
+            hero("Service temporairement indisponible", "Vos donnees restent dans Supabase.")
+            st.error(f"Connexion Supabase impossible. Reference: {safe_error_id(exc)}")
+            return
+
+    profile = restore_session()
+    if profile:
+        render_internal_app(profile)
+        return
+
+    with st.sidebar:
+        st.markdown(brand_html(dark_mode, compact=True), unsafe_allow_html=True)
+        st.toggle("Mode sombre", key="ui_dark_mode")
+        st.divider()
+        st.caption(f"Version {VERSION}")
+
+    portal_label = st.radio(
+        "Choisissez votre espace",
+        ["Administration", "Espace Client"],
+        horizontal=True,
+    )
+
+    if portal_label == "Administration":
+        login_ui()
+        if ADMIN_PASSWORD == "admin123++":
+            st.warning("Mot de passe Admin par defaut actif. Pour la production, definissez ADMIN_PASSWORD dans Streamlit Secrets.")
     else:
-        login_ui("CLIENT")
+        client_portal_ui()
+
 
 # =============================================================================
 # 22. SELF TESTS / CLI
@@ -2904,7 +2980,10 @@ def self_test() -> None:
     assert (y, w, start, end) == (2026, 42, date(2026, 10, 12), date(2026, 10, 16))
     assert subtract_business_days(date(2026, 10, 15), 2) == date(2026, 10, 13)
     assert white_black_conflict(["BLC", "NOIR"])
-    assert role_can("PLANNING", "planning") and not role_can("PLANNING", "quality")
+    assert role_can("ADMIN", "planning") and role_can("ADMIN", "logistics")
+    assert role_can("MAGASIN", "magasin") and not role_can("MAGASIN", "dashboard")
+    assert role_can("LAQUAGE", "laquage") and not role_can("LAQUAGE", "balancelles")
+    assert role_can("LOGISTIQUE", "logistics") and not role_can("LOGISTIQUE", "notifications")
     assert abs(validate_truck_load(4000, [1200, 900, 1400]) - 3500) < 1e-9
     try:
         validate_truck_load(4000, [3500, 600]); raise AssertionError("La surcharge camion devait être refusée")
@@ -2938,26 +3017,10 @@ def self_test() -> None:
     print("[OK] Excel, helpers, RBAC, planning, balancelles et capacité camion")
 
 
-def create_first_admin_cli(email: str, full_name: str) -> None:
-    require_supabase(True)
-    ok, missing = validate_supabase_schema()
-    if not ok: raise RuntimeError(f"Schéma Supabase incomplet. Tables manquantes: {', '.join(missing)}")
-    if admin_exists(): raise RuntimeError("Un administrateur actif existe déjà. Utilisez l'interface Administration pour gérer les comptes.")
-    password = getpass.getpass("Mot de passe administrateur (>=10 caractères): ")
-    confirm = getpass.getpass("Confirmer le mot de passe: ")
-    if password != confirm: raise ValueError("Les mots de passe ne correspondent pas.")
-    profile_id = create_user_supabase(email, password, full_name, "ADMIN", None)
-    print(f"Administrateur créé dans Supabase: {email} ({profile_id})")
-
 
 if __name__ == "__main__":
     if "--self-test" in sys.argv:
         self_test()
-    elif "--create-admin" in sys.argv:
-        if len(sys.argv) < 4:
-            print('Usage: python alluco_erp.py --create-admin admin@entreprise.tld "Nom Administrateur"')
-            raise SystemExit(2)
-        create_first_admin_cli(sys.argv[2], sys.argv[3])
     elif "--check-config" in sys.argv:
         print(json.dumps({"supabase_library": SUPABASE_LIBRARY_AVAILABLE, "url": bool(SUPABASE_URL), "publishable_key": bool(SUPABASE_PUBLISHABLE_KEY), "secret_key": bool(SUPABASE_SECRET_KEY), "ax_url": bool(AX_EXCEL_URL)}, indent=2))
     else:
