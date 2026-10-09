@@ -3223,10 +3223,10 @@ SOURCE_FILENAME = SOURCE_PATH.name
 DEFAULT_MIN_PER_BAL = 4.0
 HARD_MAX_COLORS_PER_DAY = 4
 
-# Le planning de référence n'utilise pas une capacité identique tous les jours.
-# Profil nominal S38, redimensionné proportionnellement si l'utilisateur change
+# Capacité de travail: 16 h par jour, du lundi au vendredi, et 0 h le samedi.
+# Profil S38 redimensionné proportionnellement si l'utilisateur change
 # la capacité de base (16 h) dans l'interface.
-S38_DAY_CAPACITY_H = (16.0, 16.1, 17.0, 15.5, 18.0, 0.0)
+S38_DAY_CAPACITY_H = (16.0, 16.0, 16.0, 16.0, 16.0, 0.0)
 ATELIER_MINUTES_PER_BAL = 4.0
 
 # 31 colonnes métier du planning atelier (les 28 historiques + 3 indicateurs).
@@ -4308,7 +4308,7 @@ def self_test(source_path: Optional[str] = None) -> None:
     check("Max couleur constant", HARD_MAX_COLORS_PER_DAY == 4)
     check("Préférence mono-couleur", PREFERRED_COLORS_PER_DAY == 1)
     cfg_rules = PlannerConfig(2026, 37)
-    check("Profil capacité S38", [day_capacity_h(cfg_rules, d) for d in range(6)] == [16.0, 16.1, 17.0, 15.5, 18.0, 0.0])
+    check("Profil capacité S38", [day_capacity_h(cfg_rules, d) for d in range(6)] == [16.0, 16.0, 16.0, 16.0, 16.0, 0.0])
     check("Samedi verrouillé 0h", day_capacity_h(cfg_rules, 5) == 0.0)
     check("Changement couleur 15min", cfg_rules.cleaning_min == 15)
     check("Temps balancelle 4min", DEFAULT_MIN_PER_BAL == 4.0)
@@ -4383,7 +4383,7 @@ def self_test(source_path: Optional[str] = None) -> None:
     check("S38 du 14/09 au 19/09", d38[0] == date(2026, 9, 14) and d38[5] == date(2026, 9, 19), d38)
     check("Schéma publication V5", PUBLISHED_PLAN_SCHEMA == 5)
     cfg0 = PlannerConfig(2026, 38, capacity_h=16.0, minutes_per_bal=4.0)
-    check("Profil capacité S38", [day_capacity_h(cfg0, d) for d in range(6)] == [16.0, 16.1, 17.0, 15.5, 18.0, 0.0])
+    check("Profil capacité S38", [day_capacity_h(cfg0, d) for d in range(6)] == [16.0, 16.0, 16.0, 16.0, 16.0, 0.0])
     check("Blanc/Noir même jour interdit", _white_black_conflict({"BLC", "NOIR"}))
     # Les jours successifs DARK -> BLC sont autorisés dans S38.
     trial = [set() for _ in range(6)]; trial[3] = {"DARK"}
@@ -4527,8 +4527,8 @@ import zlib as _zlib
 VERSION = "7.2.0-UNIVERSAL-CALIBRATED"
 ATELIER_MINUTES_PER_BAL = 4.0
 DEFAULT_MIN_PER_BAL = 4.0
-AUTO_TARGET_BALES = 250
-AUTO_MAX_BALES = 270
+AUTO_TARGET_BALES = 240
+AUTO_MAX_BALES = 240
 AUTO_MAX_COLORS = 8
 ACTIVE_SOURCE_PATH = ROOT_DIR / "active_base.xlsx"
 ACTIVE_SOURCE_META_PATH = ROOT_DIR / "active_base_meta.json"
@@ -4770,10 +4770,10 @@ def _auto_week_from_source(source: pd.DataFrame, reference_date: Optional[date] 
 
 def _auto_cfg(source: pd.DataFrame, reference_date: Optional[date] = None) -> PlannerConfig:
     year, week = _auto_week_from_source(source, reference_date)
-    # 18h = 270 balancelles à 4 min: plafond observé autour des historiques,
-    # tandis que le moteur vise environ 250 bal/jour.
+    # 16h = 240 balancelles à 4 min: capacité journalière de travail.
+    # Le moteur vise au plus 240 bal/jour.
     return PlannerConfig(
-        year=year, week=week, capacity_h=18.0,
+        year=year, week=week, capacity_h=16.0,
         saturday_enabled=False, saturday_capacity_h=0.0,
         cleaning_min=0, minutes_per_bal=ATELIER_MINUTES_PER_BAL,
         powder_coeff=DEFAULT_POWDER_COEFF, target_utilization=AUTO_TARGET_BALES / AUTO_MAX_BALES,
@@ -5107,7 +5107,7 @@ def _generic_prepared_plan(source: pd.DataFrame, cfg: PlannerConfig) -> Dict[str
         "unscheduled":backlog,"_internal_backlog":backlog,"metrics":metrics,"hard_errors":list(dict.fromkeys(hard)),"soft_warnings":[],
         "data_notes":[
             f"Base future/non historique: moteur déterministe appliqué sur {len(src)} lignes.",
-            "Paramètres automatiques: cible ~250 bal/j, plafond 270 bal/j, 4 min/bal, jusqu'à 8 couleurs si nécessaire.",
+            "Paramètres automatiques: cible ~240 bal/j, plafond 240 bal/j (16 h), 4 min/bal, jusqu'à 8 couleurs si nécessaire.",
             "Le moteur ne crée aucune commande absente de l'input; les lignes non logeables restent visibles en backlog.",
         ],
         "confidence":confidence,"engine":engine,"repair_log":[],"scenario_score":0.0,
